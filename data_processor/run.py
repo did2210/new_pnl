@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 from core.helpers import C
 from core.extractor import extract_tables, save_combined, ExtractionResult
 from core.parser import parse_file, ParseResult
-from core.merger import merge as do_merge, MergeResult
+from core.merger import merge as do_merge, MergeResult, get_db_path, load_db, DB_FILENAME
 from core.reporter import generate_report
 from core.validator import validate, save_report as save_validation, Issue
 
@@ -114,15 +114,20 @@ def ask_yn(prompt, default=True):
     return val in ('д', 'y', 'да', 'yes', '1')
 
 
-def find_excel(directory):
-    """Все .xlsx/.xls в директории."""
+def find_excel(directory, exclude_patterns=None):
+    """Все .xlsx/.xls в директории, кроме исключённых паттернов."""
     if not os.path.isdir(directory):
         return []
+    exclude_patterns = exclude_patterns or []
     result = []
     for f in sorted(os.listdir(directory)):
-        if (f.lower().endswith(('.xlsx', '.xls', '.xlsm'))
-                and not f.startswith('~')):
-            result.append(os.path.join(directory, f))
+        if not f.lower().endswith(('.xlsx', '.xls', '.xlsm')):
+            continue
+        if f.startswith('~'):
+            continue
+        if any(pat in f for pat in exclude_patterns):
+            continue
+        result.append(os.path.join(directory, f))
     return result
 
 
@@ -136,12 +141,25 @@ def banner():
 
 def show_status():
     """Показать текущее состояние пайплайна."""
+    out_dir = sess.cfg.get('output_dir', '')
+    db_path = get_db_path(out_dir) if out_dir else ''
+    db_exists = os.path.exists(db_path) if db_path else False
+    db_info = "Нет"
+    if db_exists:
+        try:
+            import pandas as pd
+            db_df = pd.read_excel(db_path)
+            db_info = f"{len(db_df)} строк"
+        except Exception:
+            db_info = "файл есть, но не читается"
+
     print(f"\n{C.BOLD}── Текущее состояние ──{C.RESET}")
     states = [
+        ("Постоянная база (contracts_db.xlsx)", db_info),
         ("Исходные файлы", len(sess.input_files)),
         ("Извлечено (шаг 1)", len(sess.extracted_files)),
         ("Распарсено (шаг 2)", len(sess.parsed_dfs)),
-        ("Объединено (шаг 3)", "Да" if sess.merged_df is not None else "Нет"),
+        ("Объединено (шаг 3)", f"{len(sess.merged_df)} строк" if sess.merged_df is not None else "Нет"),
         ("Отчёт (шаг 4)", os.path.basename(sess.report_path) if sess.report_path else "Нет"),
         ("Валидация", os.path.basename(sess.validation_path) if sess.validation_path else "Нет"),
     ]
@@ -256,7 +274,8 @@ def step2_parse():
 
     files = sess.extracted_files
     if not files:
-        files = find_excel(tmp)
+        # Подхватываем из temp, но НЕ _parsed.xlsx (промежуточные от прошлого запуска)
+        files = find_excel(tmp, exclude_patterns=['_parsed'])
     if not files:
         print(C.err("Нет файлов для парсинга. Сначала выполните Шаг 1."))
         pause()
@@ -310,13 +329,29 @@ def step3_merge():
         pause()
         return False
 
-    print(C.info(f"DataFrame для объединения: {len(sess.parsed_dfs)}"))
+    out_dir = sess.cfg['output_dir']
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(C.info(f"Новых DataFrame для добавления: {len(sess.parsed_dfs)}"))
+
+    # Показываем состояние постоянной базы
+    db_path = get_db_path(out_dir)
+    if os.path.exists(db_path):
+        try:
+            old_db = load_db(out_dir)
+            print(C.info(f"Постоянная база ({DB_FILENAME}): {len(old_db)} строк"))
+        except Exception:
+            print(C.warn(f"Постоянная база есть, но не читается"))
+    else:
+        print(C.info(f"Постоянная база не найдена — будет создана"))
 
     existing = sess.cfg.get('existing_db', '')
-    if existing:
-        print(C.info(f"Существующая база: {existing}"))
+    if existing and os.path.exists(existing):
+        print(C.info(f"Внешняя база: {existing}"))
 
-    res = do_merge(sess.parsed_dfs, existing_db=existing if existing else None)
+    res = do_merge(sess.parsed_dfs,
+                   output_dir=out_dir,
+                   existing_db=existing if existing else None)
     if res.errors:
         for e in res.errors:
             print(C.err(e))
@@ -326,15 +361,15 @@ def step3_merge():
         return False
 
     sess.merged_df = res.df
-    print(C.ok(f"Объединено: {res.total_output} строк (дубликатов удалено: {res.duplicates_removed})"))
 
-    # сохраняем
-    out_dir = sess.cfg['output_dir']
-    os.makedirs(out_dir, exist_ok=True)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    merged_path = os.path.join(out_dir, f"merged_{ts}.xlsx")
-    sess.merged_df.to_excel(merged_path, index=False)
-    print(C.ok(f"Сохранено: {merged_path}"))
+    if res.db_loaded:
+        print(C.ok(f"База была: {res.db_rows_before} строк → стало: {res.total_output} строк "
+                   f"(новых: {res.total_output - res.db_rows_before + res.duplicates_removed}, "
+                   f"дубл. удалено: {res.duplicates_removed})"))
+    else:
+        print(C.ok(f"Создана база: {res.total_output} строк"))
+
+    print(C.ok(f"Постоянная база: {db_path}"))
 
     # валидация
     print(f"\n{C.BOLD}Запускаем валидацию...{C.RESET}")
@@ -346,6 +381,7 @@ def step3_merge():
           f"{C.YELLOW}{warn} предупр.{C.RESET}  "
           f"{C.CYAN}{info} инфо{C.RESET}")
     if issues:
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         vpath = os.path.join(out_dir, f"validation_{ts}.xlsx")
         save_validation(issues, vpath)
         sess.validation_path = vpath
@@ -481,7 +517,7 @@ def step1_extract_silent():
 
 
 def step2_parse_silent():
-    files = sess.extracted_files or find_excel(sess.cfg['temp_dir'])
+    files = sess.extracted_files or find_excel(sess.cfg['temp_dir'], exclude_patterns=['_parsed'])
     if not files:
         return False
     sess.parsed_dfs = []
@@ -506,20 +542,25 @@ def step2_parse_silent():
 def step3_merge_silent():
     if not sess.parsed_dfs:
         return False
+    out_dir = sess.cfg['output_dir']
+    os.makedirs(out_dir, exist_ok=True)
     existing = sess.cfg.get('existing_db', '')
-    res = do_merge(sess.parsed_dfs, existing_db=existing if existing else None)
+    res = do_merge(sess.parsed_dfs,
+                   output_dir=out_dir,
+                   existing_db=existing if existing else None)
     if res.df.empty:
         return False
     sess.merged_df = res.df
-    out_dir = sess.cfg['output_dir']
-    os.makedirs(out_dir, exist_ok=True)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    sess.merged_df.to_excel(os.path.join(out_dir, f"merged_{ts}.xlsx"), index=False)
-    print(f"  Объединено: {res.total_output} строк (дубл. удалено: {res.duplicates_removed})")
+    if res.db_loaded:
+        print(f"  База: {res.db_rows_before} → {res.total_output} строк "
+              f"(дубл. удалено: {res.duplicates_removed})")
+    else:
+        print(f"  Создана база: {res.total_output} строк")
     issues = validate(sess.merged_df)
     crit = sum(1 for i in issues if i.sev == "КРИТИЧЕСКАЯ")
     print(f"  Валидация: {len(issues)} проблем ({crit} крит.)")
     if issues:
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         vp = os.path.join(out_dir, f"validation_{ts}.xlsx")
         save_validation(issues, vp)
         sess.validation_path = vp
