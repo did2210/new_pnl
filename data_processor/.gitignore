@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+output/*.xlsx
+temp/*.xlsx
+input/*.xlsx
+input/*.xls
+!.gitkeep
