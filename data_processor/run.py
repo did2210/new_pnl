@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 from core.helpers import C
 from core.extractor import extract_tables, save_combined, ExtractionResult
 from core.parser import parse_file, ParseResult
-from core.merger import merge as do_merge, MergeResult, get_db_path, load_db, DB_FILENAME
+from core.merger import merge as do_merge, MergeResult, get_db_path, load_db, get_processed_filenames, DB_FILENAME
 from core.reporter import generate_report
 from core.validator import validate, save_report as save_validation, Issue
 
@@ -131,6 +131,30 @@ def find_excel(directory, exclude_patterns=None):
     return result
 
 
+def filter_new_files(file_paths: list) -> tuple:
+    """
+    Возвращает (новые_файлы, пропущенные_файлы).
+    Сравниваем имя файла (без расширения) с FileName в contracts_db.xlsx.
+    """
+    out_dir = sess.cfg.get('output_dir', '')
+    if not out_dir:
+        return file_paths, []
+
+    already = get_processed_filenames(out_dir)
+    if not already:
+        return file_paths, []
+
+    new_files = []
+    skipped = []
+    for fp in file_paths:
+        name_no_ext = os.path.splitext(os.path.basename(fp))[0]
+        if name_no_ext in already:
+            skipped.append(fp)
+        else:
+            new_files.append(fp)
+    return new_files, skipped
+
+
 def banner():
     print(f"""
 {C.BOLD}{C.CYAN}╔══════════════════════════════════════════════════════════════╗
@@ -225,21 +249,34 @@ def step1_extract():
     tmp = sess.cfg['temp_dir']
     os.makedirs(tmp, exist_ok=True)
 
-    sess.input_files = find_excel(inp)
-    if not sess.input_files:
+    all_files = find_excel(inp)
+    if not all_files:
         print(C.err(f"Нет Excel-файлов в: {inp}"))
         print(C.info(f"Положите файлы в папку и попробуйте снова."))
         pause()
         return False
 
-    print(C.info(f"Найдено файлов: {len(sess.input_files)}"))
+    # Фильтруем: пропускаем уже обработанные
+    new_files, skipped = filter_new_files(all_files)
+    sess.input_files = new_files
+
+    print(C.info(f"Всего файлов в input: {len(all_files)}"))
+    if skipped:
+        print(C.info(f"Уже в базе (пропускаем): {len(skipped)}"))
+        for fp in skipped:
+            print(f"     {C.DIM}~ {os.path.basename(fp)}{C.RESET}")
+    if not new_files:
+        print(C.ok("Все файлы уже обработаны. Новых нет."))
+        pause()
+        return False
+    print(C.info(f"Новых для обработки: {len(new_files)}"))
     print()
 
     sess.extracted_files = []
     ok_count = 0
-    for i, fp in enumerate(sess.input_files, 1):
+    for i, fp in enumerate(new_files, 1):
         fname = os.path.basename(fp)
-        print(f"  [{i}/{len(sess.input_files)}] {fname}...", end=" ", flush=True)
+        print(f"  [{i}/{len(new_files)}] {fname}...", end=" ", flush=True)
         try:
             res = extract_tables(fp)
             out_path = os.path.join(tmp, fname)
@@ -257,8 +294,8 @@ def step1_extract():
         except Exception as e:
             print(C.err(str(e)))
 
-    print(f"\n{C.BOLD}Итого:{C.RESET} {ok_count}/{len(sess.input_files)} успешно")
-    sess.add_log(f"Шаг 1: {ok_count}/{len(sess.input_files)} файлов извлечено")
+    print(f"\n{C.BOLD}Итого:{C.RESET} {ok_count}/{len(new_files)} новых обработано")
+    sess.add_log(f"Шаг 1: {ok_count}/{len(new_files)} новых (+{len(skipped)} пропущено)")
     pause()
     return ok_count > 0
 
@@ -455,23 +492,37 @@ def run_all():
     print()
     start = time.time()
 
+    has_new = True
     print(f"{C.BOLD}▶ Шаг 1 / 4: Извлечение...{C.RESET}")
     if not step1_extract_silent():
-        print(C.err("Шаг 1 не удался. Прерываем."))
-        pause()
-        return
+        # Если новых файлов нет, но база существует — пропускаем 1-2, идём на 3-4
+        out_dir = sess.cfg.get('output_dir', '')
+        db_path = get_db_path(out_dir) if out_dir else ''
+        if os.path.exists(db_path):
+            print(C.info("Новых файлов нет. Используем существующую базу для отчёта."))
+            has_new = False
+        else:
+            print(C.err("Нет файлов и нет базы. Нечего обрабатывать."))
+            pause()
+            return
 
-    print(f"\n{C.BOLD}▶ Шаг 2 / 4: Парсинг...{C.RESET}")
-    if not step2_parse_silent():
-        print(C.err("Шаг 2 не удался. Прерываем."))
-        pause()
-        return
+    if has_new:
+        print(f"\n{C.BOLD}▶ Шаг 2 / 4: Парсинг...{C.RESET}")
+        if not step2_parse_silent():
+            print(C.err("Шаг 2 не удался. Прерываем."))
+            pause()
+            return
 
-    print(f"\n{C.BOLD}▶ Шаг 3 / 4: Объединение + Валидация...{C.RESET}")
-    if not step3_merge_silent():
-        print(C.err("Шаг 3 не удался. Прерываем."))
-        pause()
-        return
+        print(f"\n{C.BOLD}▶ Шаг 3 / 4: Объединение + Валидация...{C.RESET}")
+        if not step3_merge_silent():
+            print(C.err("Шаг 3 не удался. Прерываем."))
+            pause()
+            return
+    else:
+        # Загружаем базу напрямую
+        out_dir = sess.cfg['output_dir']
+        sess.merged_df = load_db(out_dir)
+        print(f"  База загружена: {len(sess.merged_df)} строк")
 
     print(f"\n{C.BOLD}▶ Шаг 4 / 4: Генерация отчёта...{C.RESET}")
     step4_report_silent()
@@ -492,15 +543,22 @@ def step1_extract_silent():
     inp = sess.cfg['input_dir']
     tmp = sess.cfg['temp_dir']
     os.makedirs(tmp, exist_ok=True)
-    sess.input_files = find_excel(inp)
-    if not sess.input_files:
+    all_files = find_excel(inp)
+    if not all_files:
         print(C.err(f"Нет файлов в: {inp}"))
+        return False
+    new_files, skipped = filter_new_files(all_files)
+    sess.input_files = new_files
+    if skipped:
+        print(f"  Уже в базе: {len(skipped)} (пропущены)")
+    if not new_files:
+        print(C.ok("Новых файлов нет — все уже в базе."))
         return False
     sess.extracted_files = []
     ok = 0
-    for i, fp in enumerate(sess.input_files, 1):
+    for i, fp in enumerate(new_files, 1):
         fname = os.path.basename(fp)
-        print(f"  [{i}/{len(sess.input_files)}] {fname}...", end=" ", flush=True)
+        print(f"  [{i}/{len(new_files)}] {fname}...", end=" ", flush=True)
         try:
             res = extract_tables(fp)
             out_path = os.path.join(tmp, fname)
@@ -512,7 +570,7 @@ def step1_extract_silent():
                 print(C.err("ошибка"))
         except Exception as e:
             print(C.err(str(e)))
-    print(f"  Извлечено: {ok}/{len(sess.input_files)}")
+    print(f"  Извлечено: {ok}/{len(new_files)} новых")
     return ok > 0
 
 

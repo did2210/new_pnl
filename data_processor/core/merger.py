@@ -96,6 +96,18 @@ def load_db(output_dir: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def get_processed_filenames(output_dir: str) -> set:
+    """
+    Возвращает множество имён файлов (FileName), которые уже есть в базе.
+    Используется чтобы не обрабатывать повторно.
+    """
+    db = load_db(output_dir)
+    if db.empty or 'FileName' not in db.columns:
+        return set()
+    names = db['FileName'].dropna().astype(str).str.strip()
+    return set(names.unique())
+
+
 def merge(dataframes: List[pd.DataFrame],
           output_dir: str,
           existing_db: str = None) -> MergeResult:
@@ -158,7 +170,7 @@ def merge(dataframes: List[pd.DataFrame],
 
     # ── СОХРАНЯЕМ ПОСТОЯННУЮ БАЗУ ──
     os.makedirs(output_dir, exist_ok=True)
-    # Бэкап
+    # Бэкап (храним максимум 3)
     if os.path.exists(db_path):
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         backup = os.path.join(output_dir, f"contracts_db_backup_{ts}.xlsx")
@@ -166,6 +178,13 @@ def merge(dataframes: List[pd.DataFrame],
             shutil.copy2(db_path, backup)
         except Exception:
             pass
+        # Удаляем старые бэкапы, оставляя 3 последних
+        backups = sorted(glob.glob(os.path.join(output_dir, 'contracts_db_backup_*.xlsx')))
+        for old_bk in backups[:-3]:
+            try:
+                os.remove(old_bk)
+            except Exception:
+                pass
     # Записываем обновлённую базу
     try:
         combined.to_excel(db_path, index=False)
