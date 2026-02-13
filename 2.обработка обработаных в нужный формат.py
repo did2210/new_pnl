@@ -263,10 +263,11 @@ def parse_plan_calendar(df_sales: pd.DataFrame) -> Optional[PlanCalendar]:
     current_month_name = None
     
     for col_idx in range(len(row_months)):
-        week_cell_raw = str(row_weeks.iloc[col_idx]).strip()
-        if any(marker in week_cell_raw.lower() for marker in exclude_markers):
-            continue
-        
+        # СНАЧАЛА обновляем текущий месяц — даже для столбцов «Итого/Всего».
+        # Причина: Excel объединяет ячейки, и «декабрь» может оказаться
+        # именно на столбце «Всего» предыдущего месяца (ноябрь).
+        # Если пропустить этот столбец целиком (continue), то cur_month
+        # не обновится и все последующие недели уйдут в ноябрь.
         month_cell = str(row_months.iloc[col_idx]).strip().lower()
         for idx, month_name in enumerate(MONTH_NAMES_RU):
             if month_name in month_cell:
@@ -281,6 +282,11 @@ def parse_plan_calendar(df_sales: pd.DataFrame) -> Optional[PlanCalendar]:
                         week_numbers=[]
                     )
                 break
+        
+        # ПОТОМ проверяем, нужно ли пропустить этот столбец
+        week_cell_raw = str(row_weeks.iloc[col_idx]).strip()
+        if any(marker in week_cell_raw.lower() for marker in exclude_markers):
+            continue
         
         week_cell = week_cell_raw.upper()
         m = re.match(r'^W(\d{1,2})$', week_cell)

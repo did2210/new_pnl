@@ -75,14 +75,20 @@ def _parse_plan_header(df: pd.DataFrame) -> Optional[_PlanCal]:
     cur_month = None
 
     for ci in range(len(months_row)):
-        wc = weeks_row.iloc[ci].strip() if ci < len(weeks_row) else ''
-        if any(s in wc.lower() for s in skip):
-            continue
+        # СНАЧАЛА обновляем текущий месяц — даже для столбцов «Итого/Всего»,
+        # потому что Excel объединяет ячейки и «декабрь» может оказаться
+        # именно на столбце «Всего» предыдущего месяца.
         mc = months_row.iloc[ci].strip().lower() if ci < len(months_row) else ''
         for idx, mn in enumerate(MONTH_RU):
             if mn in mc:
                 cur_month = idx + 1
                 break
+
+        # ПОТОМ проверяем, нужно ли пропустить столбец (итого, прирост и т.п.)
+        wc = weeks_row.iloc[ci].strip() if ci < len(weeks_row) else ''
+        if any(s in wc.lower() for s in skip):
+            continue
+
         m = re.match(r'^W(\d{1,2})$', wc, re.I)
         if m and cur_month is not None:
             wn = int(m.group(1))
