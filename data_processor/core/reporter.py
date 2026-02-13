@@ -1,61 +1,81 @@
 # -*- coding: utf-8 -*-
 """
 Шаг 4 — Генерация итогового Excel P&L-отчёта.
+
+Оптимизирован для больших объёмов (70к+ строк):
+- pandas ExcelWriter с engine='openpyxl' для записи данных
+- Форматирование ТОЛЬКО заголовков и ширины колонок (не каждой ячейки)
+- Условное форматирование через openpyxl rules (а не цикл по ячейкам)
 """
 import os
 import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, NamedStyle
 from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import CellIsRule
 
-from .helpers import series_to_num
+from .helpers import series_to_num, C
 
 
-def _fmt(wb_path):
-    """Красивое форматирование итогового файла."""
+def _fast_format(wb_path, row_count):
+    """
+    Быстрое форматирование: только заголовки + ширина + freeze.
+    НЕ трогаем каждую ячейку данных — это убивает производительность на 70к+ строк.
+    """
+    print(f"  Форматирование...", end=" ", flush=True)
     wb = load_workbook(wb_path)
+
     hdr_fill = PatternFill('solid', fgColor="2F5496")
     hdr_font = Font(name='Calibri', size=10, bold=True, color="FFFFFF")
-    plan_fill = PatternFill('solid', fgColor="D6E4F0")
-    fact_fill = PatternFill('solid', fgColor="E2EFDA")
-    diff_fill = PatternFill('solid', fgColor="FCE4D6")
-    red_font = Font(name='Calibri', size=10, color="FF0000", bold=True)
-    brd = Border(left=Side('thin'), right=Side('thin'),
-                 top=Side('thin'), bottom=Side('thin'))
+    hdr_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    hdr_border = Border(left=Side('thin'), right=Side('thin'),
+                        top=Side('thin'), bottom=Side('thin'))
 
     for ws in wb.worksheets:
         if ws.max_row <= 1:
             continue
-        for ci in range(1, ws.max_column + 1):
+
+        max_col = ws.max_column
+
+        # 1. Форматируем ТОЛЬКО заголовок (строка 1)
+        for ci in range(1, max_col + 1):
             c = ws.cell(row=1, column=ci)
             c.fill = hdr_fill
             c.font = hdr_font
-            c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            c.border = brd
-        for ri in range(2, ws.max_row + 1):
-            for ci in range(1, ws.max_column + 1):
-                c = ws.cell(row=ri, column=ci)
-                c.border = brd
-                c.alignment = Alignment(vertical='center')
-                h = str(ws.cell(row=1, column=ci).value or '').lower()
-                if 'плановые' in h or 'план' == h.strip():
-                    c.fill = plan_fill
-                elif 'фактические' in h or 'факт' == h.strip():
-                    c.fill = fact_fill
-                elif 'разница' in h:
-                    c.fill = diff_fill
-                    try:
-                        if c.value is not None and float(c.value) < 0:
-                            c.font = red_font
-                    except (ValueError, TypeError):
-                        pass
-        for ci in range(1, ws.max_column + 1):
-            mx = max((len(str(ws.cell(row=r, column=ci).value or ''))
-                       for r in range(1, min(ws.max_row + 1, 100))), default=8)
-            ws.column_dimensions[get_column_letter(ci)].width = min(mx + 4, 40)
+            c.alignment = hdr_align
+            c.border = hdr_border
+
+        # 2. Ширина колонок (по первым 50 строкам, не по всем)
+        sample_rows = min(ws.max_row, 50)
+        for ci in range(1, max_col + 1):
+            mx = 0
+            for ri in range(1, sample_rows + 1):
+                v = ws.cell(row=ri, column=ci).value
+                if v is not None:
+                    mx = max(mx, len(str(v)))
+            ws.column_dimensions[get_column_letter(ci)].width = min(mx + 4, 35)
+
+        # 3. Закрепляем шапку
         ws.freeze_panes = 'A2'
+
+        # 4. Условное форматирование — красный для отрицательных в «Разница»
+        #    (работает встроенными средствами Excel, не трогая каждую ячейку)
+        red_font = Font(color="CC0000", bold=True)
+        red_fill = PatternFill('solid', fgColor="FFF2F2")
+        for ci in range(1, max_col + 1):
+            header_val = str(ws.cell(row=1, column=ci).value or '')
+            if 'разница' in header_val.lower():
+                col_letter = get_column_letter(ci)
+                cell_range = f"{col_letter}2:{col_letter}{ws.max_row}"
+                ws.conditional_formatting.add(
+                    cell_range,
+                    CellIsRule(operator='lessThan', formula=['0'],
+                               font=red_font, fill=red_fill)
+                )
+
     wb.save(wb_path)
+    print("OK")
 
 
 def generate_report(merged_df: pd.DataFrame, out_path: str,
@@ -63,11 +83,14 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
                     cm_path=None, cogs_path=None) -> str:
     """
     Генерирует итоговый P&L-файл.
-
-    Обязательный: merged_df — объединённая база.
-    Опциональные: пути к файлам продаж, затрат, ЦМ, себестоимости.
     """
+    if merged_df.empty:
+        print(C.warn("Нет данных для отчёта"))
+        return None
+
     df = merged_df.copy()
+    row_count = len(df)
+    print(f"  Строк: {row_count:,}...", end=" ", flush=True)
 
     # ─── числовые ───
     num = ['price', 'price_in', 'listing', 'listing2', 'marketing', 'marketing2',
@@ -88,7 +111,7 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     else:
         plan = df[gk].drop_duplicates()
         plan['Плановые продажи, шт'] = 0
-    dc = plan.copy()
+    dc = plan
 
     # ─── ЦМ ───
     if cm_path and os.path.exists(cm_path):
@@ -250,16 +273,18 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             order.append(c)
     dc = dc[order]
 
-    # сохранение
-    n_chunks = max(1, len(dc) // 800_000 + (1 if len(dc) % 800_000 else 0))
-    with pd.ExcelWriter(out_path, engine='openpyxl') as w:
-        for i in range(n_chunks):
-            s, e = i * 800_000, min((i + 1) * 800_000, len(dc))
-            sn = f'Sheet{i+1}' if n_chunks > 1 else 'Результат'
-            dc.iloc[s:e].to_excel(w, sheet_name=sn, index=False)
+    final_rows = len(dc)
+    print(f"расчёт OK ({final_rows:,} строк)")
 
+    # ─── сохранение ───
+    print(f"  Запись в Excel...", end=" ", flush=True)
+    dc.to_excel(out_path, index=False, sheet_name='Результат', engine='openpyxl')
+    print("OK")
+
+    # ─── форматирование (быстрое — только заголовок) ───
     try:
-        _fmt(out_path)
-    except Exception:
-        pass
+        _fast_format(out_path, final_rows)
+    except Exception as e:
+        print(C.warn(f"Форматирование пропущено: {e}"))
+
     return out_path
