@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
+*.pyo
 *.log
 output/*.xlsx
 temp/*.xlsx
-input/*.xlsx
-input/*.xls
 !.gitkeep
+settings.json
