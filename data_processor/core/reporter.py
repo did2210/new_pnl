@@ -18,6 +18,24 @@ from openpyxl.formatting.rule import CellIsRule
 from .helpers import series_to_num, C, SKU_MAP, SKU_MAP_REV
 
 
+def _norm_pdate(df, col='pdate'):
+    """Нормализуем дату: любой формат → первое число месяца, полночь."""
+    if col not in df.columns:
+        return df
+    # Сначала пробуем dayfirst, потом без
+    parsed = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+    # Те что не распарсились — пробуем без dayfirst
+    na_mask = parsed.isna() & df[col].notna()
+    if na_mask.any():
+        parsed[na_mask] = pd.to_datetime(df.loc[na_mask, col], errors='coerce')
+    df[col] = parsed
+    # Приводим к первому числу месяца (убираем день и время)
+    mask = df[col].notna()
+    if mask.any():
+        df.loc[mask, col] = df.loc[mask, col].dt.to_period('M').dt.to_timestamp()
+    return df
+
+
 def _fast_format(wb_path, row_count):
     """
     Быстрое форматирование: только заголовки + ширина + freeze.
@@ -134,9 +152,16 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     for c in num:
         if c in df.columns:
             df[c] = series_to_num(df[c])
-    for c in ('pdate', 'start_date', 'end_date'):
+    for c in ('start_date', 'end_date'):
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], dayfirst=True, errors='coerce')
+    df = _norm_pdate(df, 'pdate')
+
+    # Диагностика: диапазон дат в базе
+    if 'pdate' in df.columns:
+        p_min = df['pdate'].min()
+        p_max = df['pdate'].max()
+        print(f"период в базе: {p_min} — {p_max}")
 
     # ─── группировка ───
     gk = [c for c in ('FileName', 'viveska', 'gr_sb', 'sku_type_sap',
@@ -158,9 +183,8 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             # Нормализуем SKU (как в оригинале load_cm)
             if normalizer and 'sku_type_sap' in cm.columns:
                 cm['sku_type_sap'] = cm['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
-            # Приводим pdate к datetime (чтобы merge совпал с dc)
-            if 'pdate' in cm.columns:
-                cm['pdate'] = pd.to_datetime(cm['pdate'], dayfirst=True, errors='coerce')
+            # Приводим pdate к datetime (1-е число месяца, без времени)
+            cm = _norm_pdate(cm, 'pdate')
             mk = [c for c in ('gr_sb', 'sku_type_sap', 'pdate') if c in cm.columns and c in dc.columns]
             if mk:
                 rows_before = len(dc)
@@ -245,6 +269,7 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
                 if normalizer:
                     sa['sku_type_sap'] = sa['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
                 sa['pdate'] = sa['sales_date']
+                sa = _norm_pdate(sa, 'pdate')
 
                 # Агрегируем
                 sa_agg = sa.groupby(['viveska', 'sku_type_sap', 'pdate'], as_index=False)['vol_2'].sum()
@@ -298,6 +323,7 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             print(f"  Загрузка затрат вне цены...", end=" ", flush=True)
             df_cost_np = pd.read_excel(costs_np_path)
             df_cost_np['pdate'] = pd.to_datetime(df_cost_np.get('Месяц/год'), errors='coerce')
+            df_cost_np = _norm_pdate(df_cost_np, 'pdate')
             df_cost_np['Сумма'] = series_to_num(df_cost_np['Сумма'])
             df_cost_np['Номер заказчика'] = series_to_num(df_cost_np['Номер заказчика'])
             if 'Продукт' in df_cost_np.columns:
@@ -342,6 +368,7 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             print(f"  Загрузка затрат в цене...", end=" ", flush=True)
             df_cost_ip = pd.read_excel(costs_ip_path)
             df_cost_ip['pdate'] = pd.to_datetime(df_cost_ip.get('Месяц/год'), errors='coerce')
+            df_cost_ip = _norm_pdate(df_cost_ip, 'pdate')
             df_cost_ip['Сумма в валюте документа'] = series_to_num(df_cost_ip['Сумма в валюте документа'])
             df_cost_ip['Номер заказчика'] = series_to_num(df_cost_ip['Номер заказчика'])
             if 'Продукт' in df_cost_ip.columns:
@@ -398,9 +425,8 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             # Нормализуем SKU (как в оригинале load_cogs)
             if normalizer and 'sku_type_sap' in cg.columns:
                 cg['sku_type_sap'] = cg['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
-            # Приводим pdate к datetime
-            if 'pdate' in cg.columns:
-                cg['pdate'] = pd.to_datetime(cg['pdate'], dayfirst=True, errors='coerce')
+            # Приводим pdate к datetime (1-е число месяца)
+            cg = _norm_pdate(cg, 'pdate')
             mk = [c for c in ('sku_type_sap', 'pdate') if c in cg.columns and c in dc.columns]
             if mk:
                 rows_before = len(dc)
