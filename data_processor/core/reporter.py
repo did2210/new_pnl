@@ -152,14 +152,26 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     # ─── ЦМ ───
     if cm_path and os.path.exists(cm_path):
         try:
+            print(f"\n  Загрузка ЦМ...", end=" ", flush=True)
             cm = pd.read_excel(cm_path)
             cm['ЦМ'] = series_to_num(cm['ЦМ'])
+            # Нормализуем SKU (как в оригинале load_cm)
+            if normalizer and 'sku_type_sap' in cm.columns:
+                cm['sku_type_sap'] = cm['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
+            # Приводим pdate к datetime (чтобы merge совпал с dc)
+            if 'pdate' in cm.columns:
+                cm['pdate'] = pd.to_datetime(cm['pdate'], dayfirst=True, errors='coerce')
             mk = [c for c in ('gr_sb', 'sku_type_sap', 'pdate') if c in cm.columns and c in dc.columns]
             if mk:
+                rows_before = len(dc)
                 dc = dc.merge(cm[mk + ['ЦМ']], on=mk, how='left')
                 dc.rename(columns={'ЦМ': 'price_in'}, inplace=True)
-        except Exception:
-            pass
+                matched = (dc['price_in'] > 0).sum()
+                print(f"OK (совпало {matched}/{len(dc)} строк)")
+                if len(dc) != rows_before:
+                    print(f"  ВНИМАНИЕ ЦМ: строк было {rows_before}, стало {len(dc)}")
+        except Exception as e:
+            print(f"ошибка: {e}")
     if 'price_in' not in dc.columns and 'price_in' in df.columns:
         pi = df.groupby(gk, as_index=False)['price_in'].first()
         dc = dc.merge(pi, on=gk, how='left')
@@ -380,13 +392,25 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     # ─── себестоимость ───
     if cogs_path and os.path.exists(cogs_path):
         try:
+            print(f"  Загрузка себестоимости...", end=" ", flush=True)
             cg = pd.read_excel(cogs_path)
             cg['cogs'] = series_to_num(cg['cogs'])
+            # Нормализуем SKU (как в оригинале load_cogs)
+            if normalizer and 'sku_type_sap' in cg.columns:
+                cg['sku_type_sap'] = cg['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
+            # Приводим pdate к datetime
+            if 'pdate' in cg.columns:
+                cg['pdate'] = pd.to_datetime(cg['pdate'], dayfirst=True, errors='coerce')
             mk = [c for c in ('sku_type_sap', 'pdate') if c in cg.columns and c in dc.columns]
             if mk:
+                rows_before = len(dc)
                 dc = dc.merge(cg[mk + ['cogs']], on=mk, how='left')
-        except Exception:
-            pass
+                matched = (dc['cogs'] > 0).sum() if 'cogs' in dc.columns else 0
+                print(f"OK (совпало {matched}/{len(dc)})")
+                if len(dc) != rows_before:
+                    print(f"  ВНИМАНИЕ COGS: строк было {rows_before}, стало {len(dc)}")
+        except Exception as e:
+            print(f"ошибка: {e}")
     if 'cogs' not in dc.columns:
         dc['cogs'] = 0.0
     dc['cogs'] = series_to_num(dc['cogs'])
