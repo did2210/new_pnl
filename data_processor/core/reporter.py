@@ -18,17 +18,24 @@ from openpyxl.formatting.rule import CellIsRule
 from .helpers import series_to_num, C, SKU_MAP, SKU_MAP_REV
 
 
+def _parse_dates_safe(values):
+    """
+    Надёжный парсинг дат с приоритетом day-first (dd.mm.yyyy).
+    Вторая попытка нужна для ISO/смешанных форматов.
+    """
+    src = values if isinstance(values, pd.Series) else pd.Series(values)
+    parsed = pd.to_datetime(src, dayfirst=True, errors='coerce')
+    na_mask = parsed.isna() & src.notna()
+    if na_mask.any():
+        parsed.loc[na_mask] = pd.to_datetime(src.loc[na_mask], errors='coerce')
+    return parsed
+
+
 def _norm_pdate(df, col='pdate'):
     """Нормализуем дату: любой формат → первое число месяца, полночь."""
     if col not in df.columns:
         return df
-    # Сначала пробуем dayfirst, потом без
-    parsed = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
-    # Те что не распарсились — пробуем без dayfirst
-    na_mask = parsed.isna() & df[col].notna()
-    if na_mask.any():
-        parsed[na_mask] = pd.to_datetime(df.loc[na_mask, col], errors='coerce')
-    df[col] = parsed
+    df[col] = _parse_dates_safe(df[col])
     # Приводим к первому числу месяца (убираем день и время)
     mask = df[col].notna()
     if mask.any():
@@ -154,7 +161,7 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             df[c] = series_to_num(df[c])
     for c in ('start_date', 'end_date'):
         if c in df.columns:
-            df[c] = pd.to_datetime(df[c], dayfirst=True, errors='coerce')
+            df[c] = _parse_dates_safe(df[c])
     df = _norm_pdate(df, 'pdate')
 
     # Диагностика: диапазон дат в базе
@@ -249,7 +256,10 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
         try:
             print(f"  Загрузка Sales...", end=" ", flush=True)
             sl = pd.read_excel(sales_path)
-            sl['sales_date'] = pd.to_datetime(sl.get('sales_date'), errors='coerce')
+            if 'sales_date' in sl.columns:
+                sl['sales_date'] = _parse_dates_safe(sl['sales_date'])
+            else:
+                sl['sales_date'] = pd.NaT
             sl['zkcode'] = series_to_num(sl['zkcode']) if 'zkcode' in sl.columns else 0
             sl['vol_2'] = series_to_num(sl['vol_2']) if 'vol_2' in sl.columns else 0
 
@@ -322,7 +332,10 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
         try:
             print(f"  Загрузка затрат вне цены...", end=" ", flush=True)
             df_cost_np = pd.read_excel(costs_np_path)
-            df_cost_np['pdate'] = pd.to_datetime(df_cost_np.get('Месяц/год'), errors='coerce')
+            if 'Месяц/год' in df_cost_np.columns:
+                df_cost_np['pdate'] = _parse_dates_safe(df_cost_np['Месяц/год'])
+            else:
+                df_cost_np['pdate'] = pd.NaT
             df_cost_np = _norm_pdate(df_cost_np, 'pdate')
             df_cost_np['Сумма'] = series_to_num(df_cost_np['Сумма'])
             df_cost_np['Номер заказчика'] = series_to_num(df_cost_np['Номер заказчика'])
@@ -367,7 +380,10 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
         try:
             print(f"  Загрузка затрат в цене...", end=" ", flush=True)
             df_cost_ip = pd.read_excel(costs_ip_path)
-            df_cost_ip['pdate'] = pd.to_datetime(df_cost_ip.get('Месяц/год'), errors='coerce')
+            if 'Месяц/год' in df_cost_ip.columns:
+                df_cost_ip['pdate'] = _parse_dates_safe(df_cost_ip['Месяц/год'])
+            else:
+                df_cost_ip['pdate'] = pd.NaT
             df_cost_ip = _norm_pdate(df_cost_ip, 'pdate')
             df_cost_ip['Сумма в валюте документа'] = series_to_num(df_cost_ip['Сумма в валюте документа'])
             df_cost_ip['Номер заказчика'] = series_to_num(df_cost_ip['Номер заказчика'])
