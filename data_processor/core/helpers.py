@@ -120,8 +120,10 @@ def contract_months(start: datetime, end: datetime) -> list:
     cur = start.replace(day=1)
     while cur <= end:
         result.append((cur.year, cur.month))
-        cur = (cur.replace(month=12, year=cur.year + 1, day=1)
-               if cur.month == 12 else cur.replace(month=cur.month + 1))
+        if cur.month == 12:
+            cur = cur.replace(month=1, year=cur.year + 1, day=1)
+        else:
+            cur = cur.replace(month=cur.month + 1)
     return result
 
 

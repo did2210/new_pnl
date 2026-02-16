@@ -42,13 +42,26 @@ class _PlanCal:
 
 # ════════════ ШАПКА ПЛАНА ════════════
 
+def _s(val) -> str:
+    """Безопасное преобразование любого значения в строку."""
+    if val is None:
+        return ''
+    s = str(val).strip()
+    return '' if s.lower() == 'nan' else s
+
+
+def _row_strs(df: pd.DataFrame, ri: int) -> list:
+    """Возвращает строку DataFrame как list[str]."""
+    return [_s(v) for v in df.iloc[ri]]
+
+
 def _parse_plan_header(df: pd.DataFrame) -> Optional[_PlanCal]:
     skip = {'тотал', 'total', 'итого', 'прирост', 'всего', 'growth'}
 
     # ищем строку с месяцами
     m_row = None
     for ri in range(min(len(df), 30)):
-        txt = ' '.join(str(c) for c in df.iloc[ri] if str(c).lower() != 'nan')
+        txt = ' '.join(_s(c) for c in df.iloc[ri])
         if any(m in txt.lower() for m in MONTH_RU):
             m_row = ri
             break
@@ -58,8 +71,8 @@ def _parse_plan_header(df: pd.DataFrame) -> Optional[_PlanCal]:
     # ищем строку с W-неделями
     w_row = None
     for ri in range(m_row + 1, min(m_row + 4, len(df))):
-        cnt = sum(1 for c in df.iloc[ri].astype(str)
-                  if re.match(r'^W\d{1,2}$', c.strip(), re.I))
+        row_s = _row_strs(df, ri)
+        cnt = sum(1 for c in row_s if re.match(r'^W\d{1,2}$', c, re.I))
         if cnt >= 8:
             w_row = ri
             break
@@ -68,8 +81,8 @@ def _parse_plan_header(df: pd.DataFrame) -> Optional[_PlanCal]:
     if w_row >= len(df):
         return None
 
-    months_row = df.iloc[m_row].astype(str)
-    weeks_row = df.iloc[w_row].astype(str)
+    months_row = _row_strs(df, m_row)
+    weeks_row = _row_strs(df, w_row)
 
     cal = _PlanCal(week_row=w_row)
     cur_month = None
@@ -78,14 +91,14 @@ def _parse_plan_header(df: pd.DataFrame) -> Optional[_PlanCal]:
         # СНАЧАЛА обновляем текущий месяц — даже для столбцов «Итого/Всего»,
         # потому что Excel объединяет ячейки и «декабрь» может оказаться
         # именно на столбце «Всего» предыдущего месяца.
-        mc = months_row.iloc[ci].strip().lower() if ci < len(months_row) else ''
+        mc = months_row[ci].lower() if ci < len(months_row) else ''
         for idx, mn in enumerate(MONTH_RU):
             if mn in mc:
                 cur_month = idx + 1
                 break
 
         # ПОТОМ проверяем, нужно ли пропустить столбец (итого, прирост и т.п.)
-        wc = weeks_row.iloc[ci].strip() if ci < len(weeks_row) else ''
+        wc = weeks_row[ci] if ci < len(weeks_row) else ''
         if any(s in wc.lower() for s in skip):
             continue
 
@@ -115,7 +128,7 @@ def _weekly_any_col(df, sku, cal: _PlanCal, marker: str) -> Dict[int, float]:
     for i in range(cal.week_row + 1, len(df)):
         r = df.iloc[i]
         c0 = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ''
-        row_str = ' '.join(r.astype(str))
+        row_str = ' '.join(str(v) for v in r)
         if sku in c0 and marker in row_str:
             return {wn: to_float(r.iloc[ci]) for wn, ci in cal.week_to_col.items() if ci < len(r)}
     return {}
@@ -157,7 +170,8 @@ def _distribute(weekly: Dict[int, float], start_dt: datetime, end_dt: datetime,
     if sgw is None:
         return {p: 0.0 for p in periods}
 
-    for i in range(52):
+    # 104 = до 2 лет (контракт может быть дольше 52 недель)
+    for i in range(104):
         gw = sgw + i
         if gw not in cal:
             break
@@ -194,7 +208,7 @@ def _prom_vol(weekly_vol, weekly_tm, start_dt, end_dt):
             break
     if sgw is None:
         return result
-    for i in range(52):
+    for i in range(104):
         gw = sgw + i
         if gw not in cal:
             break
@@ -368,17 +382,18 @@ def _field(df, label, offset=3):
     rows = df[df.apply(lambda r: r.astype(str).str.contains(label, case=False, na=False).any(), axis=1)]
     if rows.empty:
         return ''
-    rd = rows.iloc[0].astype(str)
+    rd = rows.iloc[0]
     idx = None
-    for i, c in enumerate(rd):
+    for i in range(len(rd)):
+        c = str(rd.iloc[i])
         if label.lower() in c.lower():
             idx = i
             break
     if idx is None:
         return ''
     for i in range(idx + 1, len(rd)):
-        v = rd.iloc[i]
-        if v != 'nan' and v.strip():
+        v = str(rd.iloc[i]).strip()
+        if v and v != 'nan' and v != 'None':
             return v
     return ''
 
@@ -387,7 +402,9 @@ def _forma(df):
     rows = df[df.apply(lambda r: any(str(c).startswith('Форма от') for c in r.astype(str)), axis=1)]
     if rows.empty:
         return ''
-    vals = [v for v in rows.iloc[0].astype(str) if v != 'nan']
+    vals = [str(v) for v in rows.iloc[0] if pd.notna(v) and str(v).strip() not in ('', 'nan')]
+    if not vals:
+        return ''
     full = ' | '.join(vals)
     return full.split('.')[0] + '.' if '.' in full else full
 
@@ -424,7 +441,8 @@ def _dates(df_contract):
             continue
         rd = rows.iloc[0]
         ci = None
-        for i, c in enumerate(rd.astype(str)):
+        for i in range(len(rd)):
+            c = str(rd.iloc[i])
             if label in c.lower():
                 ci = i
                 break
@@ -451,10 +469,10 @@ def _sku_data(df_contract):
 
     bri = hits.index[0]
     hri = bri
-    hrow = df_contract.iloc[bri].astype(str)
+    hrow = [str(v) for v in df_contract.iloc[bri]]
     if 'Кол-во ТТ с листингом' not in ' '.join(hrow):
         if bri + 1 < len(df_contract):
-            p = df_contract.iloc[bri + 1].astype(str)
+            p = [str(v) for v in df_contract.iloc[bri + 1]]
             if 'Кол-во ТТ с листингом' in ' '.join(p):
                 hri = bri + 1
                 hrow = p
