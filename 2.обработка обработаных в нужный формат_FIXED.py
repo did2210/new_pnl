@@ -469,7 +469,8 @@ def distribute_weekly_to_contract_months(
         logger.error("Не найдена стартовая неделя в календаре!")
         return result
     
-    for i in range(52):
+    # 104 = до 2 лет (контракт может быть дольше 52 недель, например дек→дек = 57 нед.)
+    for i in range(104):
         global_week = start_global_week + i
         
         if global_week not in ECP_CALENDAR:
@@ -520,7 +521,7 @@ def calculate_monthly_tm_plan(
     
     month_tm_values: dict[tuple[int, int], list[float]] = {key: [] for key in result.keys()}
     
-    for i in range(52):
+    for i in range(104):
         global_week = start_global_week + i
         if global_week not in ECP_CALENDAR:
             break
@@ -565,7 +566,7 @@ def calculate_monthly_price(
     
     month_prices: dict[tuple[int, int], list[float]] = {key: [] for key in result.keys()}
     
-    for i in range(52):
+    for i in range(104):
         global_week = start_global_week + i
         if global_week not in ECP_CALENDAR:
             break
@@ -610,7 +611,7 @@ def calculate_prom_vol_monthly(
     if start_global_week is None:
         return result
     
-    for i in range(52):
+    for i in range(104):
         global_week = start_global_week + i
         if global_week not in ECP_CALENDAR:
             break
