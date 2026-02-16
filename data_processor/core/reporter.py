@@ -171,8 +171,7 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
         print(f"  ecp_map: {len(ecp_map)} записей (sap-code → viveska)")
 
     # ─── факт продаж ───
-    # Sales.xlsx: zkcode, brand, sales_date, vol_2
-    # zkcode → sap-code → viveska; brand → sku_type_sap; sales_date → pdate
+    # Как в оригинальном 4.py: подтягиваем ТОЛЬКО к действующим контрактам
     dc['Факт продажи, шт.'] = 0.0
     if sales_path and os.path.exists(sales_path):
         try:
@@ -182,39 +181,57 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             sl['zkcode'] = series_to_num(sl['zkcode']) if 'zkcode' in sl.columns else 0
             sl['vol_2'] = series_to_num(sl['vol_2']) if 'vol_2' in sl.columns else 0
 
-            # Группируем
             if 'zkcode' in sl.columns and 'brand' in sl.columns:
                 sa = sl.groupby(['zkcode', 'brand', 'sales_date'], as_index=False)['vol_2'].sum()
+                before_merge = len(sa)
 
-                # Привязываем viveska через ecp_map
+                # zkcode → viveska через ecp_map
                 if not ecp_map.empty:
                     sa = sa.merge(ecp_map[['sap-code', 'viveska']],
                                   left_on='zkcode', right_on='sap-code', how='inner')
                     sa.drop(columns=['sap-code'], errors='ignore', inplace=True)
+                    print(f"({before_merge}→{len(sa)} после ecp_map) ", end="", flush=True)
 
-                # brand → sku_type_sap (оставляем как есть — названия совпадают)
                 sa.rename(columns={'brand': 'sku_type_sap'}, inplace=True)
                 sa['pdate'] = sa['sales_date']
 
-                # Агрегируем по ключам
+                # Агрегируем
                 sa_agg = sa.groupby(['viveska', 'sku_type_sap', 'pdate'], as_index=False)['vol_2'].sum()
-                before = len(dc)
-                dc = dc.merge(sa_agg, on=['viveska', 'sku_type_sap', 'pdate'], how='left')
-                dc['Факт продажи, шт.'] = series_to_num(dc.get('vol_2', 0))
-                dc.drop(columns=['vol_2'], errors='ignore', inplace=True)
+
+                # Как в оригинале: merge ТОЛЬКО к действующим
+                rows_before = len(dc)
+                if 'контракт' in dc.columns:
+                    df_active = dc[dc['контракт'] == 'действующий'].copy()
+                    df_rest = dc[dc['контракт'] != 'действующий'].copy()
+                    df_active = df_active.merge(sa_agg, on=['viveska', 'sku_type_sap', 'pdate'], how='left')
+                    df_active['Факт продажи, шт.'] = series_to_num(df_active.get('vol_2', 0))
+                    df_active.drop(columns=['vol_2'], errors='ignore', inplace=True)
+                    dc = pd.concat([df_rest, df_active], ignore_index=True)
+                else:
+                    dc = dc.merge(sa_agg, on=['viveska', 'sku_type_sap', 'pdate'], how='left')
+                    dc['Факт продажи, шт.'] = series_to_num(dc.get('vol_2', 0))
+                    dc.drop(columns=['vol_2'], errors='ignore', inplace=True)
+
+                if len(dc) != rows_before:
+                    print(f"ВНИМАНИЕ: строк было {rows_before}, стало {len(dc)}", end=" ")
                 matched = (dc['Факт продажи, шт.'] > 0).sum()
-                print(f"OK ({len(sa_agg)} записей, совпало {matched})")
+                print(f"OK (совпало {matched})")
             else:
                 print("нет столбцов zkcode/brand")
         except Exception as e:
             print(f"ошибка: {e}")
+
+    dc['Факт продажи, шт.'] = series_to_num(dc['Факт продажи, шт.'])
     dc['Факт продажи, руб (от ЦМ)'] = dc['Факт продажи, шт.'] * dc['price_in']
     dc['Разница, шт'] = dc['Факт продажи, шт.'] - dc['Плановые продажи, шт']
     dc['Разница, руб'] = dc['Факт продажи, руб (от ЦМ)'] - dc['Плановые продажи, руб']
 
     # ─── факт затрат ───
-    # затраты_вне_цены.xlsx: Номер заказчика → sap-code → viveska; Продукт → sku_type_sap
-    # затраты_в_цене.xlsx: аналогично
+    # Точная копия логики из оригинального 4.py:
+    # 1. Загружаем файл → Номер заказчика → merge ecp_map → viveska
+    # 2. Продукт → sku_type_sap; Месяц/год → pdate
+    # 3. Группируем по (pdate, viveska, sku_type_sap) и суммируем
+    # 4. Merge с dc по тем же 3 ключам
     fact_cols = [
         'Фактические затраты «Листинг/безусловные выплаты», руб',
         'Фактические затраты «Ретро», руб',
@@ -222,61 +239,85 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
         'Фактические затраты «Промо-скидка», руб',
         'Фактические затраты «Скидка в цене», руб',
     ]
+
+    # --- Затраты вне цены ---
+    df_cost_np = pd.DataFrame()
     if costs_np_path and os.path.exists(costs_np_path):
         try:
             print(f"  Загрузка затрат вне цены...", end=" ", flush=True)
-            cnp = pd.read_excel(costs_np_path)
-            cnp['Сумма'] = series_to_num(cnp['Сумма'])
-            cnp['Номер заказчика'] = series_to_num(cnp['Номер заказчика'])
-            cnp['pdate'] = pd.to_datetime(cnp.get('Месяц/год'), errors='coerce')
-            if 'Продукт' in cnp.columns:
-                cnp.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
+            df_cost_np = pd.read_excel(costs_np_path)
+            df_cost_np['pdate'] = pd.to_datetime(df_cost_np.get('Месяц/год'), errors='coerce')
+            df_cost_np['Сумма'] = series_to_num(df_cost_np['Сумма'])
+            df_cost_np['Номер заказчика'] = series_to_num(df_cost_np['Номер заказчика'])
+            if 'Продукт' in df_cost_np.columns:
+                df_cost_np.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
             # Привязываем viveska
-            if not ecp_map.empty and 'Номер заказчика' in cnp.columns:
-                cnp = cnp.merge(ecp_map[['sap-code', 'viveska']],
-                                left_on='Номер заказчика', right_on='sap-code', how='left')
-                cnp.drop(columns=['sap-code'], errors='ignore', inplace=True)
-            # Фильтр: только «нет» в Фонды
-            if 'Фонды' in cnp.columns:
-                cnp = cnp[cnp['Фонды'].str.contains('нет', case=False, na=False)]
-            mk = [c for c in ('pdate', 'viveska', 'sku_type_sap') if c in cnp.columns]
-            if len(mk) == 3:
-                for exp, cn in [('Листинг', fact_cols[0]), ('Маркетинг', fact_cols[2]),
-                                ('Ретро', fact_cols[1])]:
-                    f = cnp[cnp['Статья расходов'].str.contains(exp, case=False, na=False)]
-                    if not f.empty:
-                        g = f.groupby(mk, as_index=False)['Сумма'].sum()
-                        dc = dc.merge(g, on=mk, how='left', suffixes=('', f'_{exp}'))
-                        dc.rename(columns={'Сумма': cn}, inplace=True)
+            if not ecp_map.empty:
+                before_m = len(df_cost_np)
+                df_cost_np = df_cost_np.merge(ecp_map[['sap-code', 'viveska']],
+                                              left_on='Номер заказчика', right_on='sap-code', how='left')
+                df_cost_np.drop(columns=['sap-code'], errors='ignore', inplace=True)
+                print(f"({before_m}→{len(df_cost_np)}) ", end="", flush=True)
+            # Фильтр: Фонды = 'нет'
+            if 'Фонды' in df_cost_np.columns:
+                df_cost_np = df_cost_np[df_cost_np['Фонды'].str.contains('нет', case=False, na=False)]
             print("OK")
         except Exception as e:
             print(f"ошибка: {e}")
 
+    # Присоединяем затраты вне цены: Листинг, Маркетинг, Ретро
+    merge_keys = ['viveska', 'sku_type_sap', 'pdate']
+    if not df_cost_np.empty and all(c in df_cost_np.columns for c in merge_keys + ['Статья расходов', 'Сумма']):
+        for expense, col_name in [
+            ('Листинг', fact_cols[0]),
+            ('Маркетинг', fact_cols[2]),
+            ('Ретро', fact_cols[1])
+        ]:
+            filtered = df_cost_np[df_cost_np['Статья расходов'].str.contains(expense, case=False, na=False)]
+            if not filtered.empty:
+                grouped = filtered.groupby(merge_keys, as_index=False)['Сумма'].sum()
+                rows_before = len(dc)
+                dc = pd.merge(dc, grouped, on=merge_keys, how='left')
+                dc.rename(columns={'Сумма': col_name}, inplace=True)
+                if len(dc) != rows_before:
+                    print(f"  ВНИМАНИЕ {expense}: строк было {rows_before}, стало {len(dc)}")
+
+    # --- Затраты в цене ---
+    df_cost_ip = pd.DataFrame()
     if costs_ip_path and os.path.exists(costs_ip_path):
         try:
             print(f"  Загрузка затрат в цене...", end=" ", flush=True)
-            cip = pd.read_excel(costs_ip_path)
-            cip['Сумма в валюте документа'] = series_to_num(cip['Сумма в валюте документа'])
-            cip['Номер заказчика'] = series_to_num(cip['Номер заказчика'])
-            cip['pdate'] = pd.to_datetime(cip.get('Месяц/год'), errors='coerce')
-            if 'Продукт' in cip.columns:
-                cip.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
+            df_cost_ip = pd.read_excel(costs_ip_path)
+            df_cost_ip['pdate'] = pd.to_datetime(df_cost_ip.get('Месяц/год'), errors='coerce')
+            df_cost_ip['Сумма в валюте документа'] = series_to_num(df_cost_ip['Сумма в валюте документа'])
+            df_cost_ip['Номер заказчика'] = series_to_num(df_cost_ip['Номер заказчика'])
+            if 'Продукт' in df_cost_ip.columns:
+                df_cost_ip.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
             # Привязываем viveska
-            if not ecp_map.empty and 'Номер заказчика' in cip.columns:
-                cip = cip.merge(ecp_map[['sap-code', 'viveska']],
-                                left_on='Номер заказчика', right_on='sap-code', how='left')
-                cip.drop(columns=['sap-code'], errors='ignore', inplace=True)
-            mk = [c for c in ('pdate', 'viveska', 'sku_type_sap') if c in cip.columns]
-            if len(mk) == 3 and 'примечание' in cip.columns:
-                for pattern, cn in [('промо акция', fact_cols[3]), ('скидка в цене', fact_cols[4])]:
-                    f = cip[cip['примечание'].str.contains(pattern, case=False, na=False)]
-                    if not f.empty:
-                        g = f.groupby(mk, as_index=False)['Сумма в валюте документа'].sum()
-                        dc = dc.merge(g, on=mk, how='left', suffixes=('', f'_{pattern[:5]}'))
-                        dc.rename(columns={'Сумма в валюте документа': cn}, inplace=True)
+            if not ecp_map.empty:
+                before_m = len(df_cost_ip)
+                df_cost_ip = df_cost_ip.merge(ecp_map[['sap-code', 'viveska']],
+                                              left_on='Номер заказчика', right_on='sap-code', how='left')
+                df_cost_ip.drop(columns=['sap-code'], errors='ignore', inplace=True)
+                print(f"({before_m}→{len(df_cost_ip)}) ", end="", flush=True)
             print("OK")
         except Exception as e:
             print(f"ошибка: {e}")
+
+    # Промо-скидка и Скидка в цене
+    if not df_cost_ip.empty and 'примечание' in df_cost_ip.columns and all(c in df_cost_ip.columns for c in merge_keys):
+        for pattern, col_name in [
+            ('промо акция', fact_cols[3]),
+            ('скидка в цене', fact_cols[4])
+        ]:
+            filtered = df_cost_ip[df_cost_ip['примечание'].str.contains(pattern, case=False, na=False)]
+            if not filtered.empty:
+                grouped = filtered.groupby(merge_keys, as_index=False)['Сумма в валюте документа'].sum()
+                rows_before = len(dc)
+                dc = pd.merge(dc, grouped, on=merge_keys, how='left')
+                dc.rename(columns={'Сумма в валюте документа': col_name}, inplace=True)
+                if len(dc) != rows_before:
+                    print(f"  ВНИМАНИЕ {pattern}: строк было {rows_before}, стало {len(dc)}")
 
     for c in fact_cols:
         if c not in dc.columns:
