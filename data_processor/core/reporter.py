@@ -15,7 +15,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, NamedSty
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import CellIsRule
 
-from .helpers import series_to_num, C
+from .helpers import series_to_num, C, SKU_MAP, SKU_MAP_REV
 
 
 def _fast_format(wb_path, row_count):
@@ -153,26 +153,68 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     else:
         dc['контракт'] = 'действующий'
 
+    # ─── Построение ecp_map: sap-code → viveska ───
+    # (как load_ecp_map в оригинальном 4.py)
+    ecp_map = pd.DataFrame()
+    if 'sap-code' in df.columns and 'viveska' in df.columns:
+        rows = []
+        for _, r in df[['viveska', 'sap-code']].drop_duplicates().iterrows():
+            codes = str(r['sap-code']).split(';')
+            for code in codes:
+                c = code.strip()
+                if c and c.lower() not in ('nan', 'none', ''):
+                    rows.append({'sap-code': c, 'viveska': r['viveska']})
+        if rows:
+            ecp_map = pd.DataFrame(rows)
+            ecp_map['sap-code'] = series_to_num(ecp_map['sap-code'])
+            ecp_map = ecp_map.drop_duplicates(subset=['sap-code', 'viveska'], keep='first')
+        print(f"  ecp_map: {len(ecp_map)} записей (sap-code → viveska)")
+
     # ─── факт продаж ───
+    # Sales.xlsx: zkcode, brand, sales_date, vol_2
+    # zkcode → sap-code → viveska; brand → sku_type_sap; sales_date → pdate
     dc['Факт продажи, шт.'] = 0.0
     if sales_path and os.path.exists(sales_path):
         try:
+            print(f"  Загрузка Sales...", end=" ", flush=True)
             sl = pd.read_excel(sales_path)
             sl['sales_date'] = pd.to_datetime(sl.get('sales_date'), errors='coerce')
-            sl['vol_2'] = series_to_num(sl['vol_2'])
-            mk = [c for c in ('viveska', 'sku_type_sap', 'pdate') if c in sl.columns and c in dc.columns]
-            if mk:
-                sa = sl.groupby(mk, as_index=False)['vol_2'].sum()
-                dc = dc.merge(sa, on=mk, how='left')
-                dc['Факт продажи, шт.'] = series_to_num(dc['vol_2'])
+            sl['zkcode'] = series_to_num(sl['zkcode']) if 'zkcode' in sl.columns else 0
+            sl['vol_2'] = series_to_num(sl['vol_2']) if 'vol_2' in sl.columns else 0
+
+            # Группируем
+            if 'zkcode' in sl.columns and 'brand' in sl.columns:
+                sa = sl.groupby(['zkcode', 'brand', 'sales_date'], as_index=False)['vol_2'].sum()
+
+                # Привязываем viveska через ecp_map
+                if not ecp_map.empty:
+                    sa = sa.merge(ecp_map[['sap-code', 'viveska']],
+                                  left_on='zkcode', right_on='sap-code', how='inner')
+                    sa.drop(columns=['sap-code'], errors='ignore', inplace=True)
+
+                # brand → sku_type_sap (оставляем как есть — названия совпадают)
+                sa.rename(columns={'brand': 'sku_type_sap'}, inplace=True)
+                sa['pdate'] = sa['sales_date']
+
+                # Агрегируем по ключам
+                sa_agg = sa.groupby(['viveska', 'sku_type_sap', 'pdate'], as_index=False)['vol_2'].sum()
+                before = len(dc)
+                dc = dc.merge(sa_agg, on=['viveska', 'sku_type_sap', 'pdate'], how='left')
+                dc['Факт продажи, шт.'] = series_to_num(dc.get('vol_2', 0))
                 dc.drop(columns=['vol_2'], errors='ignore', inplace=True)
-        except Exception:
-            pass
+                matched = (dc['Факт продажи, шт.'] > 0).sum()
+                print(f"OK ({len(sa_agg)} записей, совпало {matched})")
+            else:
+                print("нет столбцов zkcode/brand")
+        except Exception as e:
+            print(f"ошибка: {e}")
     dc['Факт продажи, руб (от ЦМ)'] = dc['Факт продажи, шт.'] * dc['price_in']
     dc['Разница, шт'] = dc['Факт продажи, шт.'] - dc['Плановые продажи, шт']
     dc['Разница, руб'] = dc['Факт продажи, руб (от ЦМ)'] - dc['Плановые продажи, руб']
 
     # ─── факт затрат ───
+    # затраты_вне_цены.xlsx: Номер заказчика → sap-code → viveska; Продукт → sku_type_sap
+    # затраты_в_цене.xlsx: аналогично
     fact_cols = [
         'Фактические затраты «Листинг/безусловные выплаты», руб',
         'Фактические затраты «Ретро», руб',
@@ -182,35 +224,59 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     ]
     if costs_np_path and os.path.exists(costs_np_path):
         try:
+            print(f"  Загрузка затрат вне цены...", end=" ", flush=True)
             cnp = pd.read_excel(costs_np_path)
             cnp['Сумма'] = series_to_num(cnp['Сумма'])
+            cnp['Номер заказчика'] = series_to_num(cnp['Номер заказчика'])
             cnp['pdate'] = pd.to_datetime(cnp.get('Месяц/год'), errors='coerce')
-            mk = [c for c in ('pdate', 'viveska', 'sku_type_sap') if c in cnp.columns and c in dc.columns]
-            if mk:
+            if 'Продукт' in cnp.columns:
+                cnp.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
+            # Привязываем viveska
+            if not ecp_map.empty and 'Номер заказчика' in cnp.columns:
+                cnp = cnp.merge(ecp_map[['sap-code', 'viveska']],
+                                left_on='Номер заказчика', right_on='sap-code', how='left')
+                cnp.drop(columns=['sap-code'], errors='ignore', inplace=True)
+            # Фильтр: только «нет» в Фонды
+            if 'Фонды' in cnp.columns:
+                cnp = cnp[cnp['Фонды'].str.contains('нет', case=False, na=False)]
+            mk = [c for c in ('pdate', 'viveska', 'sku_type_sap') if c in cnp.columns]
+            if len(mk) == 3:
                 for exp, cn in [('Листинг', fact_cols[0]), ('Маркетинг', fact_cols[2]),
                                 ('Ретро', fact_cols[1])]:
                     f = cnp[cnp['Статья расходов'].str.contains(exp, case=False, na=False)]
                     if not f.empty:
                         g = f.groupby(mk, as_index=False)['Сумма'].sum()
-                        dc = dc.merge(g, on=mk, how='left')
+                        dc = dc.merge(g, on=mk, how='left', suffixes=('', f'_{exp}'))
                         dc.rename(columns={'Сумма': cn}, inplace=True)
-        except Exception:
-            pass
+            print("OK")
+        except Exception as e:
+            print(f"ошибка: {e}")
+
     if costs_ip_path and os.path.exists(costs_ip_path):
         try:
+            print(f"  Загрузка затрат в цене...", end=" ", flush=True)
             cip = pd.read_excel(costs_ip_path)
             cip['Сумма в валюте документа'] = series_to_num(cip['Сумма в валюте документа'])
+            cip['Номер заказчика'] = series_to_num(cip['Номер заказчика'])
             cip['pdate'] = pd.to_datetime(cip.get('Месяц/год'), errors='coerce')
-            mk = [c for c in ('pdate', 'viveska', 'sku_type_sap') if c in cip.columns and c in dc.columns]
-            if mk and 'примечание' in cip.columns:
+            if 'Продукт' in cip.columns:
+                cip.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
+            # Привязываем viveska
+            if not ecp_map.empty and 'Номер заказчика' in cip.columns:
+                cip = cip.merge(ecp_map[['sap-code', 'viveska']],
+                                left_on='Номер заказчика', right_on='sap-code', how='left')
+                cip.drop(columns=['sap-code'], errors='ignore', inplace=True)
+            mk = [c for c in ('pdate', 'viveska', 'sku_type_sap') if c in cip.columns]
+            if len(mk) == 3 and 'примечание' in cip.columns:
                 for pattern, cn in [('промо акция', fact_cols[3]), ('скидка в цене', fact_cols[4])]:
                     f = cip[cip['примечание'].str.contains(pattern, case=False, na=False)]
                     if not f.empty:
                         g = f.groupby(mk, as_index=False)['Сумма в валюте документа'].sum()
-                        dc = dc.merge(g, on=mk, how='left')
+                        dc = dc.merge(g, on=mk, how='left', suffixes=('', f'_{pattern[:5]}'))
                         dc.rename(columns={'Сумма в валюте документа': cn}, inplace=True)
-        except Exception:
-            pass
+            print("OK")
+        except Exception as e:
+            print(f"ошибка: {e}")
 
     for c in fact_cols:
         if c not in dc.columns:
