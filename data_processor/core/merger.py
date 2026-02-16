@@ -43,10 +43,19 @@ def _normalize_dates(df: pd.DataFrame) -> pd.DataFrame:
 
 def _dedup(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Дедупликация: приоритет у записей с более поздней start_date
-    (то есть новые контракты перебивают старые).
+    Дедупликация контрактов.
+
+    Ключ уникальности: (FileName, sku_type_sap, pdate)
+    - FileName идентифицирует конкретный контракт
+    - sku_type_sap — SKU
+    - pdate — период (месяц)
+
+    Если ОДИН И ТОТ ЖЕ контракт загружен повторно (тот же FileName)
+    с обновлёнными данными — новые строки перебивают старые.
+    Разные контракты (разный FileName) на одну вывеску НЕ удаляются.
     """
-    sort_cols = [c for c in ('viveska', 'sku_type_sap', 'pdate', 'start_date')
+    # Сортируем: новые данные (по start_date) вверх — они приоритетнее
+    sort_cols = [c for c in ('FileName', 'sku_type_sap', 'pdate', 'start_date')
                  if c in df.columns]
     if sort_cols:
         asc = [True] * len(sort_cols)
@@ -54,7 +63,8 @@ def _dedup(df: pd.DataFrame) -> pd.DataFrame:
             asc[sort_cols.index('start_date')] = False
         df = df.sort_values(by=sort_cols, ascending=asc)
 
-    key_cols = [c for c in ('viveska', 'sku_type_sap', 'pdate') if c in df.columns]
+    # Дедуп: один FileName + один SKU + один месяц = одна строка
+    key_cols = [c for c in ('FileName', 'sku_type_sap', 'pdate') if c in df.columns]
     if key_cols:
         before = len(df)
         df = df.drop_duplicates(subset=key_cols, keep='first').reset_index(drop=True)

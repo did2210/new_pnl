@@ -38,6 +38,7 @@ DEFAULTS = {
     'output_dir': os.path.join(HERE, 'output'),
     'temp_dir': os.path.join(HERE, 'temp'),
     'existing_db': '',
+    'methodichka_file': '',
     'sales_file': '',
     'costs_not_price_file': '',
     'costs_in_price_file': '',
@@ -205,6 +206,7 @@ def menu_settings():
         ('output_dir',           'Папка для результатов'),
         ('temp_dir',             'Папка для промежуточных файлов'),
         ('existing_db',          'Существующая база (xlsx, пусто = нет)'),
+        ('methodichka_file',     'Методичка (xlsx, лист итог — нормализация SKU)'),
         ('sales_file',           'Файл продаж Sales.xlsx (пусто = нет)'),
         ('costs_not_price_file', 'Затраты вне цены (пусто = нет)'),
         ('costs_in_price_file',  'Затраты в цене (пусто = нет)'),
@@ -449,6 +451,7 @@ def step4_report():
 
     print(C.info(f"Строк в базе: {len(sess.merged_df)}"))
     extras = {
+        'methodichka_path': sess.cfg.get('methodichka_file', ''),
         'sales_path': sess.cfg.get('sales_file', ''),
         'costs_np_path': sess.cfg.get('costs_not_price_file', ''),
         'costs_ip_path': sess.cfg.get('costs_in_price_file', ''),
@@ -633,6 +636,7 @@ def step4_report_silent():
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     rp = os.path.join(out_dir, f"PnL_report_{ts}.xlsx")
     extras = {
+        'methodichka_path': sess.cfg.get('methodichka_file', '') or None,
         'sales_path': sess.cfg.get('sales_file', '') or None,
         'costs_np_path': sess.cfg.get('costs_not_price_file', '') or None,
         'costs_ip_path': sess.cfg.get('costs_in_price_file', '') or None,

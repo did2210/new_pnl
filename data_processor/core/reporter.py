@@ -78,7 +78,38 @@ def _fast_format(wb_path, row_count):
     print("OK")
 
 
+def _load_normalizer(methodichka_path):
+    """Загружает нормализатор SKU из методички (лист 'итог')."""
+    if not methodichka_path or not os.path.exists(methodichka_path):
+        return {}
+    try:
+        df_m = pd.read_excel(methodichka_path, sheet_name='итог')
+        if 'sku_type_sap' not in df_m.columns or 'itog' not in df_m.columns:
+            print(C.warn("Методичка: нет столбцов 'sku_type_sap' и 'itog'"))
+            return {}
+        mapping = {}
+        for _, row in df_m.iterrows():
+            src = str(row['sku_type_sap']).strip()
+            tgt = str(row['itog']).strip()
+            if src and tgt and src != 'nan' and tgt != 'nan':
+                mapping[src] = tgt
+        print(f"  Методичка: {len(mapping)} SKU-маппингов загружено")
+        return mapping
+    except Exception as e:
+        print(C.warn(f"Методичка: ошибка загрузки — {e}"))
+        return {}
+
+
+def _normalize_sku(value, normalizer):
+    """Приводит SKU к стандартному виду через методичку."""
+    if pd.isna(value):
+        return value
+    s = str(value).strip()
+    return normalizer.get(s, s)
+
+
 def generate_report(merged_df: pd.DataFrame, out_path: str,
+                    methodichka_path=None,
                     sales_path=None, costs_np_path=None, costs_ip_path=None,
                     cm_path=None, cogs_path=None) -> str:
     """
@@ -91,6 +122,11 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
     df = merged_df.copy()
     row_count = len(df)
     print(f"  Строк: {row_count:,}...", end=" ", flush=True)
+
+    # ─── Нормализация SKU через методичку ───
+    normalizer = _load_normalizer(methodichka_path)
+    if normalizer and 'sku_type_sap' in df.columns:
+        df['sku_type_sap'] = df['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
 
     # ─── числовые ───
     num = ['price', 'price_in', 'listing', 'listing2', 'marketing', 'marketing2',
@@ -193,6 +229,9 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
                     print(f"({before_merge}→{len(sa)} после ecp_map) ", end="", flush=True)
 
                 sa.rename(columns={'brand': 'sku_type_sap'}, inplace=True)
+                # Нормализуем SKU через методичку (как в оригинале)
+                if normalizer:
+                    sa['sku_type_sap'] = sa['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
                 sa['pdate'] = sa['sales_date']
 
                 # Агрегируем
@@ -251,6 +290,8 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             df_cost_np['Номер заказчика'] = series_to_num(df_cost_np['Номер заказчика'])
             if 'Продукт' in df_cost_np.columns:
                 df_cost_np.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
+            if normalizer and 'sku_type_sap' in df_cost_np.columns:
+                df_cost_np['sku_type_sap'] = df_cost_np['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
             # Привязываем viveska
             if not ecp_map.empty:
                 before_m = len(df_cost_np)
@@ -293,6 +334,8 @@ def generate_report(merged_df: pd.DataFrame, out_path: str,
             df_cost_ip['Номер заказчика'] = series_to_num(df_cost_ip['Номер заказчика'])
             if 'Продукт' in df_cost_ip.columns:
                 df_cost_ip.rename(columns={'Продукт': 'sku_type_sap'}, inplace=True)
+            if normalizer and 'sku_type_sap' in df_cost_ip.columns:
+                df_cost_ip['sku_type_sap'] = df_cost_ip['sku_type_sap'].apply(lambda x: _normalize_sku(x, normalizer))
             # Привязываем viveska
             if not ecp_map.empty:
                 before_m = len(df_cost_ip)
