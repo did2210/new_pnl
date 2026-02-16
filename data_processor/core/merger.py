@@ -43,34 +43,53 @@ def _normalize_dates(df: pd.DataFrame) -> pd.DataFrame:
 
 def _dedup(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Дедупликация контрактов.
+    Двухуровневая дедупликация контрактов.
 
-    Ключ уникальности: (FileName, sku_type_sap, pdate)
-    - FileName идентифицирует конкретный контракт
-    - sku_type_sap — SKU
-    - pdate — период (месяц)
+    Уровень 1: (FileName, sku_type_sap, pdate)
+      Один и тот же контракт загружен повторно (с +1 месяцем) →
+      старые строки заменяются новыми, новый месяц добавляется.
 
-    Если ОДИН И ТОТ ЖЕ контракт загружен повторно (тот же FileName)
-    с обновлёнными данными — новые строки перебивают старые.
-    Разные контракты (разный FileName) на одну вывеску НЕ удаляются.
+    Уровень 2: (viveska, sku_type_sap, pdate)
+      Два РАЗНЫХ контракта на одну вывеску/SKU/период →
+      оставляем только НОВЫЙ (более поздняя start_date).
+      Именно так работал оригинальный код 3.
     """
-    # Сортируем: новые данные (по start_date) вверх — они приоритетнее
-    sort_cols = [c for c in ('FileName', 'sku_type_sap', 'pdate', 'start_date')
-                 if c in df.columns]
-    if sort_cols:
-        asc = [True] * len(sort_cols)
-        if 'start_date' in sort_cols:
-            asc[sort_cols.index('start_date')] = False
-        df = df.sort_values(by=sort_cols, ascending=asc)
+    before = len(df)
 
-    # Дедуп: один FileName + один SKU + один месяц = одна строка
-    key_cols = [c for c in ('FileName', 'sku_type_sap', 'pdate') if c in df.columns]
-    if key_cols:
-        before = len(df)
-        df = df.drop_duplicates(subset=key_cols, keep='first').reset_index(drop=True)
-        removed = before - len(df)
-        if removed > 0:
-            logger.info(f"  Удалено дубликатов: {removed}")
+    # ── Уровень 1: убираем дубли от повторной загрузки того же файла ──
+    sort1 = [c for c in ('FileName', 'sku_type_sap', 'pdate', 'start_date')
+             if c in df.columns]
+    if sort1:
+        asc1 = [True] * len(sort1)
+        if 'start_date' in sort1:
+            asc1[sort1.index('start_date')] = False
+        df = df.sort_values(by=sort1, ascending=asc1)
+
+    key1 = [c for c in ('FileName', 'sku_type_sap', 'pdate') if c in df.columns]
+    if key1:
+        df = df.drop_duplicates(subset=key1, keep='first').reset_index(drop=True)
+
+    removed1 = before - len(df)
+
+    # ── Уровень 2: при пересечении контрактов — новый побеждает ──
+    sort2 = [c for c in ('viveska', 'sku_type_sap', 'pdate', 'start_date')
+             if c in df.columns]
+    if sort2:
+        asc2 = [True] * len(sort2)
+        if 'start_date' in sort2:
+            asc2[sort2.index('start_date')] = False
+        df = df.sort_values(by=sort2, ascending=asc2)
+
+    key2 = [c for c in ('viveska', 'sku_type_sap', 'pdate') if c in df.columns]
+    if key2:
+        df = df.drop_duplicates(subset=key2, keep='first').reset_index(drop=True)
+
+    removed2 = (before - removed1) - len(df)
+    total_removed = before - len(df)
+
+    if total_removed > 0:
+        logger.info(f"  Дедуп: -{removed1} повторных загрузок, -{removed2} перекрытых контрактов")
+
     return df
 
 
