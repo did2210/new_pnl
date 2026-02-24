@@ -70,10 +70,14 @@ class ProductBrain:
         self._fuzzy_threshold = 75
 
     def build(self, file_path: str = 'product.xlsx'):
-        """Строит мозг из product.xlsx."""
+        """Строит мозг из Excel-файла."""
         logger.info(f"Загрузка {file_path}...")
         df = pd.read_excel(file_path)
         logger.info(f"Загружено {len(df)} записей")
+        self.build_from_dataframe(df)
+
+    def build_from_dataframe(self, df: pd.DataFrame):
+        """Строит мозг из произвольного DataFrame (SQL, Excel, CSV и т.д.)."""
 
         required = ['xname', 'brand2', 'proizvod2', 'litrag', 'category']
         for c in required:
