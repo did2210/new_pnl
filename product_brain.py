@@ -1,30 +1,13 @@
 """
-product_brain.py — «Мозг» для расшифровки товарных наименований.
+product_brain.py — Точка входа для «Мозга» расшифровки товарных наименований.
 
-Строит справочную базу из product.xlsx:
-  - Таблица эталонов (canonical): уникальные комбинации brand2 + proizvod2 + litrag + category
-  - Таблица алиасов (aliases): каждое xname привязано к эталону
-
-Поиск работает без нейронок:
-  1. Точное совпадение по нормализованному xname
-  2. Нечёткий поиск (fuzzy matching) через rapidfuzz — расстояние Левенштейна
-  3. Нераспознанные имена логируются для ручной доработки
+Использование:
+    python product_brain.py           — построить мозг + прогнать самотест
+    python product_brain.py --build   — только построить и сохранить
 """
 
-import pandas as pd
-import os
-import re
+import sys
 import logging
-from dataclasses import dataclass
-from typing import Optional
-
-try:
-    from rapidfuzz import fuzz, process as rf_process
-    HAS_FUZZY = True
-except ImportError:
-    HAS_FUZZY = False
-    print("ВНИМАНИЕ: rapidfuzz не установлен. Нечёткий поиск недоступен.")
-    print("Установите: pip install rapidfuzz")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,566 +17,272 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
 
-BRAIN_FILE = 'product_brain.xlsx'
+from brain.core import ProductBrain
+
 SOURCE_FILE = 'product.xlsx'
-UNRECOGNIZED_FILE = 'unrecognized_xnames.xlsx'
+BRAIN_FILE = 'product_brain.xlsx'
 
 
-def normalize_text(text: str) -> str:
-    """Приводит текст к единому виду для сравнения."""
-    if not text or pd.isna(text):
-        return ''
-    s = str(text).strip()
-    s = s.upper()
-    s = re.sub(r'\s+', ' ', s)
-    s = s.replace('Ё', 'Е')
-    s = re.sub(r'[^\w\s.,/]', '', s)
-    return s.strip()
-
-
-def normalize_xname_key(xname: str) -> str:
-    """Более агрессивная нормализация для ключа поиска."""
-    s = normalize_text(xname)
-    s = re.sub(r':\d+$', '', s)
-    s = re.sub(r'\(.*?\)', '', s)
-    s = re.sub(r'\d+[.,]?\d*\s*Л', '', s)
-    s = re.sub(r'Б/А|Б\.А\.|БЕЗАЛК|СИЛЬНОГАЗ|СИЛГАЗ|СИЛ/ГАЗ|НЕГАЗ|ГАЗ|ПЛ/БУТ|ПЭТ|Ж/Б|СТ/Б', '', s)
-    s = re.sub(r'НАПИТОК|НАПИТ|НАП|ЭНЕРГ|ЭНЕРГЕТ|КОКТЕЙЛЬ', '', s)
-    s = re.sub(r'\s+', ' ', s)
-    return s.strip()
-
-
-@dataclass
-class CanonicalProduct:
-    """Эталонная запись продукта."""
-    canonical_id: int
-    brand2: str
-    proizvod2: str
-    litrag: float
-    category: str
-    subcategory: str
-
-
-@dataclass
-class LookupResult:
-    """Результат поиска в мозге."""
-    found: bool
-    method: str  # 'exact', 'normalized', 'fuzzy', 'parsed', 'not_found'
-    confidence: float
-    canonical_id: Optional[int]
-    brand2: str
-    proizvod2: str
-    litrag: float
-    category: str
-    subcategory: str
-    matched_alias: str
-
-
-# Ключевые слова для автоопределения категории из xname
-_ENERGY_KEYWORDS = [
-    'ЭНЕРГ', 'ENERGY', 'ЭНЕРГЕТИК', 'ЭНЕРГЕТ', 'ТОНИЗИР', 'ТОНИЗ',
-    'POWER', 'BOOST', 'CAFFEIN', 'КОФЕИН', 'ТАУРИНПЛ', 'ТАУРИНСОД',
-]
-_SODA_KEYWORDS = [
-    'ГАЗ', 'ГАЗИР', 'ЛИМОНАД', 'ДЮШЕС', 'ТАРХУН', 'БАЙКАЛ', 'КОЛА',
-    'COLA', 'МОХИТО', 'MOJITO', 'SPRITE', 'FANTA', 'PEPSI',
-    'СИЛЬНОГАЗ', 'СИЛ/ГАЗ', 'СИЛГАЗ',
-]
-
-
-_SUBCATEGORY_ENERGY_KEYWORDS = [
-    'ЭНЕРГЕТИК', 'ENERGY', 'ЭНЕРГ НАП', 'ЭНЕРГЕТ НАП',
-    'ТОНИЗИР', 'POWER', 'BOOST', 'КОФЕИН', 'CAFFEIN',
-]
-_SUBCATEGORY_SODA_KEYWORDS = [
-    'ЛИМОНАД', 'ГАЗИРОВК', 'ГАЗИРОВАНН', 'СЛАДК', 'ГАЗ НАП',
-    'КОЛА', 'COLA', 'ДЮШЕС', 'ТАРХУН', 'БАЙКАЛ', 'МОХИТО',
-    'СПРАЙТ', 'SPRITE', 'ФАНТА', 'FANTA', 'PEPSI', 'ПЕПСИ',
-]
-
-
-def guess_subcategory(xname_upper: str, category: str) -> str:
-    """Определяет subcategory для неизвестного товара по ключевым словам."""
-    if category == 'ЭНЕРГЕТИКИ':
-        if 'Ж/Б' in xname_upper or 'CAN' in xname_upper or 'ЖБ' in xname_upper:
-            return 'Энергетические напитки ж/б'
-        if 'ПЭТ' in xname_upper or 'PET' in xname_upper or 'ПЛ/БУТ' in xname_upper:
-            return 'Энергетические напитки ПЭТ'
-        return 'Энергетические напитки'
-
-    if category == 'ГАЗИРОВКА':
-        for kw in ['КОЛА', 'COLA']:
-            if kw in xname_upper:
-                return 'Лимонады кола-содержащие'
-        for kw in ['ДЮШЕС']:
-            if kw in xname_upper:
-                return 'Лимонады дюшес'
-        for kw in ['ТАРХУН']:
-            if kw in xname_upper:
-                return 'Лимонады тархун'
-        for kw in ['ЛИМОНАД', 'ГАЗИРОВАНН', 'ГАЗИР']:
-            if kw in xname_upper:
-                return 'Лимонады, сладкие газированные напитки'
-        return 'Газированные напитки'
-
-    return 'Прочее'
-
-
-def parse_xname_fields(xname: str) -> dict:
-    """
-    Разбирает совершенно неизвестный xname по правилам:
-      - litrag: ищет паттерн вроде '0,5Л', '1.5л', '473мл'
-      - category: определяет по ключевым словам
-      - subcategory: более детальное определение типа
-      - brand2: для газировки ставит LOCAL, для энергетиков — из xname
-      - proizvod2: пытается вытащить производителя из скобок
-    """
-    s = str(xname).strip()
-    s_upper = s.upper()
-
-    litrag = 0.0
-    m = re.search(r'(\d+[.,]?\d*)\s*Л', s_upper)
-    if m:
-        litrag = float(m.group(1).replace(',', '.'))
-    else:
-        m = re.search(r'(\d+)\s*МЛ', s_upper)
-        if m:
-            litrag = float(m.group(1)) / 1000.0
-
-    category = 'ПРОЧЕЕ'
-    for kw in _ENERGY_KEYWORDS:
-        if kw in s_upper:
-            category = 'ЭНЕРГЕТИКИ'
-            break
-    if category == 'ПРОЧЕЕ':
-        for kw in _SODA_KEYWORDS:
-            if kw in s_upper:
-                category = 'ГАЗИРОВКА'
-                break
-
-    subcategory = guess_subcategory(s_upper, category)
-
-    proizvod2 = ''
-    m_prod = re.search(r'\(([^)]+)\)', s)
-    if m_prod:
-        proizvod2 = m_prod.group(1).strip().upper()
-
-    clean = re.sub(r'\(.*?\)', '', s_upper)
-    clean = re.sub(r':\d+\s*$', '', clean)
-    clean = re.sub(r'\d+[.,]?\d*\s*(Л|МЛ|ПЭТ|PET|CAN|Ж/Б|СТ/Б|ПЛ/БУТ)', '', clean)
-    noise = [
-        'НАПИТОК', 'НАПИТ', 'НАП', 'ЭНЕРГЕТИЧЕСКИЙ', 'ЭНЕРГЕТИК', 'ЭНЕРГЕТ', 'ЭНЕРГ',
-        'Б/А', 'БЕЗАЛК', 'БЕЗАЛКОГОЛЬНЫЙ', 'СИЛЬНОГАЗ', 'СИЛГАЗ', 'СИЛ/ГАЗ',
-        'НЕГАЗ', 'ГАЗИРОВАННЫЙ', 'ГАЗИР', 'ГАЗ', 'ТОНИЗИРУЮЩИЙ', 'ТОНИЗ',
-        'КОКТЕЙЛЬ', 'СОКОСОДЕРЖАЩИЙ', 'С МЯК', 'ОСВ', 'ОСВЕТЛ',
-    ]
-    for word in noise:
-        clean = clean.replace(word, '')
-    clean = re.sub(r'\s+', ' ', clean).strip()
-
-    raw_brand = clean.split()[0] if clean.split() else ''
-
-    if category == 'ГАЗИРОВКА':
-        brand2 = 'LOCAL'
-    else:
-        brand2 = raw_brand
-
-    return {
-        'brand2': brand2,
-        'raw_brand': raw_brand,
-        'proizvod2': proizvod2 if proizvod2 else 'UNKNOWN',
-        'litrag': round(litrag, 3),
-        'category': category,
-        'subcategory': subcategory,
-    }
-
-
-class ProductBrain:
-    """Справочная база для расшифровки товарных наименований."""
-
-    def __init__(self):
-        self.canonicals: dict[int, CanonicalProduct] = {}
-        self.aliases_exact: dict[str, int] = {}       # xname -> canonical_id
-        self.aliases_normalized: dict[str, int] = {}   # normalized xname -> canonical_id
-        self.aliases_key: dict[str, int] = {}          # aggressive normalized -> canonical_id
-        self.all_alias_keys: list[str] = []
-        self.unrecognized: list[dict] = []
-        self._fuzzy_threshold = 80
-
-    def build_from_product_xlsx(self, file_path: str = SOURCE_FILE):
-        """Строит мозг из product.xlsx."""
-        logger.info(f"Загрузка {file_path}...")
-        df = pd.read_excel(file_path)
-        logger.info(f"Загружено {len(df)} записей")
-
-        required = ['xname', 'brand2', 'proizvod2', 'litrag', 'category']
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"Отсутствуют столбцы: {missing}")
-
-        use_cols = required + (['subcategory'] if 'subcategory' in df.columns else [])
-        df_work = df[use_cols].copy()
-        df_work['brand2'] = df_work['brand2'].astype(str).str.strip().str.upper()
-        df_work['proizvod2'] = df_work['proizvod2'].astype(str).str.strip().str.upper()
-        df_work['category'] = df_work['category'].astype(str).str.strip().str.upper()
-        df_work['litrag'] = pd.to_numeric(df_work['litrag'], errors='coerce').fillna(0.0)
-        if 'subcategory' not in df_work.columns:
-            df_work['subcategory'] = ''
-        df_work['subcategory'] = df_work['subcategory'].fillna('').astype(str).str.strip()
-
-        canonical_groups = df_work.groupby(
-            ['brand2', 'proizvod2', 'litrag', 'category']
-        ).agg(
-            alias_count=('xname', 'count'),
-            subcategory=('subcategory', 'first')
-        ).reset_index()
-
-        canonical_groups = canonical_groups.sort_values(
-            'alias_count', ascending=False
-        ).reset_index(drop=True)
-
-        self.canonicals = {}
-        canonical_key_to_id: dict[tuple, int] = {}
-
-        for idx, row in canonical_groups.iterrows():
-            cid = idx + 1
-            key = (row['brand2'], row['proizvod2'], row['litrag'], row['category'])
-            self.canonicals[cid] = CanonicalProduct(
-                canonical_id=cid,
-                brand2=row['brand2'],
-                proizvod2=row['proizvod2'],
-                litrag=row['litrag'],
-                category=row['category'],
-                subcategory=row['subcategory']
-            )
-            canonical_key_to_id[key] = cid
-
-        logger.info(f"Создано {len(self.canonicals)} эталонных продуктов")
-
-        self.aliases_exact = {}
-        self.aliases_normalized = {}
-        self.aliases_key = {}
-
-        local_aliases_exact: dict[str, int] = {}
-        local_aliases_norm: dict[str, int] = {}
-        local_aliases_key: dict[str, int] = {}
-
-        for _, row in df_work.iterrows():
-            xname = str(row['xname']).strip()
-            brand2 = row['brand2']
-            proizvod2 = row['proizvod2']
-            litrag = row['litrag']
-            category = row['category']
-
-            key = (brand2, proizvod2, litrag, category)
-            cid = canonical_key_to_id.get(key)
-            if cid is None:
-                continue
-
-            is_local = (brand2 == 'LOCAL')
-
-            xname_upper = xname.upper()
-            xname_norm = normalize_text(xname)
-            xname_key = normalize_xname_key(xname)
-
-            if is_local:
-                if xname_upper not in self.aliases_exact:
-                    local_aliases_exact[xname_upper] = cid
-                if xname_norm and xname_norm not in self.aliases_normalized:
-                    local_aliases_norm[xname_norm] = cid
-                if xname_key and xname_key not in self.aliases_key:
-                    local_aliases_key[xname_key] = cid
-            else:
-                self.aliases_exact[xname_upper] = cid
-                if xname_norm:
-                    self.aliases_normalized[xname_norm] = cid
-                if xname_key:
-                    self.aliases_key[xname_key] = cid
-
-        for k, v in local_aliases_exact.items():
-            if k not in self.aliases_exact:
-                self.aliases_exact[k] = v
-        for k, v in local_aliases_norm.items():
-            if k not in self.aliases_normalized:
-                self.aliases_normalized[k] = v
-        for k, v in local_aliases_key.items():
-            if k not in self.aliases_key:
-                self.aliases_key[k] = v
-
-        self.all_alias_keys = list(self.aliases_key.keys())
-
-        logger.info(f"Индексировано алиасов: exact={len(self.aliases_exact)}, "
-                     f"normalized={len(self.aliases_normalized)}, "
-                     f"key={len(self.aliases_key)}")
-
-    def lookup(self, xname: str) -> LookupResult:
-        """Ищет xname в базе. Возвращает LookupResult."""
-        if not xname or pd.isna(xname):
-            return LookupResult(False, 'not_found', 0.0, None, '', '', 0.0, '', '', '')
-
-        xname_str = str(xname).strip()
-
-        xname_upper = xname_str.upper()
-        cid = self.aliases_exact.get(xname_upper)
-        if cid is not None:
-            cp = self.canonicals[cid]
-            return LookupResult(True, 'exact', 100.0, cid,
-                                cp.brand2, cp.proizvod2, cp.litrag, cp.category,
-                                cp.subcategory, xname_str)
-
-        xname_norm = normalize_text(xname_str)
-        cid = self.aliases_normalized.get(xname_norm)
-        if cid is not None:
-            cp = self.canonicals[cid]
-            return LookupResult(True, 'normalized', 95.0, cid,
-                                cp.brand2, cp.proizvod2, cp.litrag, cp.category,
-                                cp.subcategory, xname_str)
-
-        xname_key = normalize_xname_key(xname_str)
-        cid = self.aliases_key.get(xname_key)
-        if cid is not None:
-            cp = self.canonicals[cid]
-            return LookupResult(True, 'normalized', 90.0, cid,
-                                cp.brand2, cp.proizvod2, cp.litrag, cp.category,
-                                cp.subcategory, xname_str)
-
-        if HAS_FUZZY and self.all_alias_keys and xname_key:
-            match = rf_process.extractOne(
-                xname_key,
-                self.all_alias_keys,
-                scorer=fuzz.token_set_ratio,
-                score_cutoff=self._fuzzy_threshold
-            )
-            if match:
-                matched_text, score, _ = match
-                cid = self.aliases_key[matched_text]
-                cp = self.canonicals[cid]
-                return LookupResult(True, 'fuzzy', score, cid,
-                                    cp.brand2, cp.proizvod2, cp.litrag, cp.category,
-                                    cp.subcategory, matched_text)
-
-        parsed = parse_xname_fields(xname_str)
-        self.unrecognized.append({
-            'xname': xname_str,
-            'parsed_brand2': parsed['brand2'],
-            'raw_brand': parsed['raw_brand'],
-            'parsed_proizvod2': parsed['proizvod2'],
-            'parsed_litrag': parsed['litrag'],
-            'parsed_category': parsed['category'],
-            'parsed_subcategory': parsed['subcategory'],
-        })
-        return LookupResult(
-            found=True,
-            method='parsed',
-            confidence=30.0,
-            canonical_id=None,
-            brand2=parsed['brand2'],
-            proizvod2=parsed['proizvod2'],
-            litrag=parsed['litrag'],
-            category=parsed['category'],
-            subcategory=parsed['subcategory'],
-            matched_alias='',
-        )
-
-    def lookup_batch(self, xnames: list[str]) -> list[LookupResult]:
-        """Пакетный поиск для списка xname."""
-        return [self.lookup(x) for x in xnames]
-
-    def save_brain(self, output_path: str = BRAIN_FILE):
-        """Сохраняет мозг в Excel для просмотра и ручной правки."""
-        logger.info(f"Сохранение мозга в {output_path}...")
-
-        canonical_rows = []
-        for cid, cp in sorted(self.canonicals.items()):
-            alias_count = sum(1 for v in self.aliases_exact.values() if v == cid)
-            canonical_rows.append({
-                'canonical_id': cp.canonical_id,
-                'brand2': cp.brand2,
-                'proizvod2': cp.proizvod2,
-                'litrag': cp.litrag,
-                'category': cp.category,
-                'subcategory': cp.subcategory,
-                'alias_count': alias_count
-            })
-        df_canonical = pd.DataFrame(canonical_rows)
-
-        alias_rows = []
-        seen = set()
-        for xname_upper, cid in self.aliases_exact.items():
-            if xname_upper not in seen:
-                seen.add(xname_upper)
-                cp = self.canonicals[cid]
-                alias_rows.append({
-                    'xname': xname_upper,
-                    'canonical_id': cid,
-                    'brand2': cp.brand2,
-                    'proizvod2': cp.proizvod2,
-                    'litrag': cp.litrag,
-                    'category': cp.category,
-                    'subcategory': cp.subcategory
-                })
-        df_aliases = pd.DataFrame(alias_rows)
-
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df_canonical.to_excel(writer, sheet_name='Эталоны', index=False)
-            df_aliases.to_excel(writer, sheet_name='Алиасы', index=False)
-
-        logger.info(f"Сохранено: {len(df_canonical)} эталонов, {len(df_aliases)} алиасов")
-
-    def save_unrecognized(self, output_path: str = UNRECOGNIZED_FILE):
-        """Сохраняет нераспознанные xname с автоматическим разбором для ручной проверки."""
-        if not self.unrecognized:
-            logger.info("Нераспознанных записей нет")
-            return
-
-        df = pd.DataFrame(self.unrecognized).drop_duplicates(subset=['xname'])
-        col_order = [
-            'xname', 'parsed_brand2', 'raw_brand',
-            'parsed_proizvod2', 'parsed_litrag',
-            'parsed_category', 'parsed_subcategory'
-        ]
-        for c in col_order:
-            if c not in df.columns:
-                df[c] = ''
-        df = df[col_order]
-        df.columns = [
-            'xname', 'brand2 (авто)', 'raw_brand (из xname)',
-            'proizvod2 (авто)', 'litrag (авто)',
-            'category (авто)', 'subcategory (авто)'
-        ]
-        df.to_excel(output_path, index=False)
-        logger.info(f"Сохранено {len(df)} нераспознанных xname в {output_path}")
-
-    def load_brain(self, brain_path: str = BRAIN_FILE):
-        """Загружает мозг из ранее сохранённого Excel."""
-        logger.info(f"Загрузка мозга из {brain_path}...")
-
-        df_canonical = pd.read_excel(brain_path, sheet_name='Эталоны')
-        df_aliases = pd.read_excel(brain_path, sheet_name='Алиасы')
-
-        self.canonicals = {}
-        for _, row in df_canonical.iterrows():
-            cid = int(row['canonical_id'])
-            self.canonicals[cid] = CanonicalProduct(
-                canonical_id=cid,
-                brand2=str(row['brand2']).strip(),
-                proizvod2=str(row['proizvod2']).strip(),
-                litrag=float(row['litrag']),
-                category=str(row['category']).strip(),
-                subcategory=str(row.get('subcategory', '')).strip()
-            )
-
-        self.aliases_exact = {}
-        self.aliases_normalized = {}
-        self.aliases_key = {}
-
-        for _, row in df_aliases.iterrows():
-            xname = str(row['xname']).strip()
-            cid = int(row['canonical_id'])
-            self.aliases_exact[xname.upper()] = cid
-            self.aliases_normalized[normalize_text(xname)] = cid
-            xkey = normalize_xname_key(xname)
-            if xkey:
-                self.aliases_key[xkey] = cid
-
-        self.all_alias_keys = list(self.aliases_key.keys())
-
-        logger.info(f"Загружено: {len(self.canonicals)} эталонов, {len(self.aliases_exact)} алиасов")
-
-    def add_alias(self, xname: str, canonical_id: int):
-        """Добавляет новый алиас к существующему эталону."""
-        if canonical_id not in self.canonicals:
-            raise ValueError(f"canonical_id={canonical_id} не найден")
-
-        xname_upper = xname.strip().upper()
-        self.aliases_exact[xname_upper] = canonical_id
-        self.aliases_normalized[normalize_text(xname)] = canonical_id
-        xkey = normalize_xname_key(xname)
-        if xkey:
-            self.aliases_key[xkey] = canonical_id
-            if xkey not in self.all_alias_keys:
-                self.all_alias_keys.append(xkey)
-
-        logger.info(f"Добавлен алиас: '{xname}' -> canonical_id={canonical_id}")
-
-    def stats(self):
-        """Выводит статистику мозга."""
-        total_canonicals = len(self.canonicals)
-        total_aliases = len(self.aliases_exact)
-        non_local = sum(1 for c in self.canonicals.values() if c.brand2 != 'LOCAL')
-        local = total_canonicals - non_local
-
-        brands = set(c.brand2 for c in self.canonicals.values() if c.brand2 != 'LOCAL')
-        categories = set(c.category for c in self.canonicals.values())
-
-        print(f"{'='*50}")
-        print(f"  СТАТИСТИКА МОЗГА")
-        print(f"{'='*50}")
-        print(f"  Эталонных продуктов:     {total_canonicals}")
-        print(f"    - с брендом (не LOCAL): {non_local}")
-        print(f"    - LOCAL:                {local}")
-        print(f"  Алиасов (xname):         {total_aliases}")
-        print(f"  Уникальных брендов:      {len(brands)}")
-        print(f"  Категорий:               {len(categories)}")
-        print(f"    {', '.join(sorted(categories))}")
-        print(f"  Нечёткий поиск:          {'ДА' if HAS_FUZZY else 'НЕТ'}")
-        print(f"  Порог fuzzy:             {self._fuzzy_threshold}%")
-        print(f"{'='*50}")
-
-
-def build_brain():
-    """Полный цикл: загрузка product.xlsx -> построение -> сохранение мозга."""
+def build():
     brain = ProductBrain()
-    brain.build_from_product_xlsx(SOURCE_FILE)
+    brain.build(SOURCE_FILE)
     brain.save_brain(BRAIN_FILE)
     brain.stats()
     return brain
 
 
-def demo_lookup(brain: ProductBrain):
-    """Демонстрация поиска с разными вариантами написания."""
-    test_names = [
-        # Известные бренды — разные варианты написания
-        "TORNADO ENERGY Напиток энергет айс 0,5л(Росинка):12",
-        "tornado energy",
-        "FRESH BAR Мохито Напит б/а Сильногаз0,48л пл/бут(Росинка):12",
-        "фреш бар мохито",
-        "E-ON CITRUS PUNCH",
-        "eon citrus",
-        "COCA-COLA Напиток газированный 1,5л пл/бут(Кока-Кола):9",
-        "кока кола 1.5",
-        # Совершенно новый бренд — его нет в базе
-        "СУПЕРКОЛА Напиток газированный б/а 0,5л ПЭТ(НовыйЗавод):12",
-        "МЕГАЭНЕРДЖИ Энергетический напиток тониз 0,45л ж/б(ООО Сила):24",
-        "НЕСУЩЕСТВУЮЩИЙ ТОВАР 777",
+def self_test(brain: ProductBrain) -> bool:
+    """
+    Самотест с тремя уровнями сложности.
+    Возвращает True, если все тесты пройдены.
+    """
+    tests = [
+        # =========================================================
+        #  ЛЁГКИЕ — полное или почти полное название из базы
+        # =========================================================
+        {
+            'name': 'MONSTER ENERGY НАПИТОК 0,5Л ПЭТ(ЛИДЕР):12',
+            'expect_brand': 'MONSTER',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'EASY',
+        },
+        {
+            'name': 'BURN Энерг Напиток 0,5л ПЭТ(Кока-Кола):12',
+            'expect_brand': 'BURN',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'EASY',
+        },
+        {
+            'name': 'COCA-COLA Напиток газированный 1,5л пл/бут(Кока-Кола):9',
+            'expect_brand': 'COCA-COLA',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'EASY',
+        },
+        {
+            'name': 'FRESH BAR Мохито Напит б/а Сильногаз0,48л пл/бут(Росинка):12',
+            'expect_brand': 'FRESH BAR',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'EASY',
+        },
+        {
+            'name': 'E-ON CITRUS PUNCH',
+            'expect_brand': 'E-ON',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'EASY',
+        },
+        {
+            'name': 'TORNADO ENERGY Напиток энергет айс 0,5л(Росинка):12',
+            'expect_brand': 'TORNADO',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'EASY',
+        },
+        {
+            'name': 'ИЛЬИНСКИЕ ЛИМОНАДЫ Напиток дюшес сил/газ 0,5л пл/бут(Дал):12',
+            'expect_brand': 'ИЛЬИНСКИЕ ЛИМОНАДЫ',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'EASY',
+        },
+        {
+            'name': 'LIT ENERGY Напиток энергетический 0,45л ж/б',
+            'expect_brand': 'LIT ENERGY',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'EASY',
+        },
+
+        # =========================================================
+        #  СРЕДНИЕ — сокращения, перестановки, русские варианты
+        # =========================================================
+        {
+            'name': 'tornado energy',
+            'expect_brand': 'TORNADO',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'фреш бар мохито',
+            'expect_brand': 'FRESH BAR',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'eon citrus',
+            'expect_brand': 'E-ON',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'кока кола 1.5',
+            'expect_brand': 'COCA-COLA',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'торнадо энерджи шторм 473мл пэт',
+            'expect_brand': 'TORNADO',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'Е-ОН черная сила 450мл банка',
+            'expect_brand': 'E-ON',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'монстер энерджи 0.5',
+            'expect_brand': 'MONSTER',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'берн тропик 0,5л',
+            'expect_brand': 'BURN',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'спрайт газ 1,5 литра',
+            'expect_brand': 'SPRITE',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'MEDIUM',
+        },
+        {
+            'name': 'ильинские лимонады дюшес 500мл',
+            'expect_brand': 'ИЛЬИНСКИЕ ЛИМОНАДЫ',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'MEDIUM',
+        },
+
+        # =========================================================
+        #  СЛОЖНЫЕ — аббревиатуры, нестандартный литраж, сленг
+        # =========================================================
+        {
+            'name': 'лит энерг 0.45 жб',
+            'expect_brand': 'LIT ENERGY',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'HARD',
+        },
+        {
+            'name': 'ФБ мохито газ пол литра',
+            'expect_brand': 'FRESH BAR',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'HARD',
+        },
+        {
+            'name': 'КК зеро 0,33 банка',
+            'expect_brand': 'COCA-COLA',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'HARD',
+        },
+        {
+            'name': 'РБ энерг 0.25 жб',
+            'expect_brand': 'RED BULL',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'HARD',
+        },
+        {
+            'name': 'горилла энерг банка 0.45',
+            'expect_brand': 'GORILLA',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'HARD',
+        },
+        {
+            'name': 'драйв ми 0,449л',
+            'expect_brand': 'DRIVE ME',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'HARD',
+        },
+        {
+            'name': 'флеш ап энерг 0.5 пэт',
+            'expect_brand': 'FLASH UP',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'HARD',
+        },
+
+        # =========================================================
+        #  НОВЫЕ БРЕНДЫ — нет в базе, проверяем авторазбор
+        # =========================================================
+        {
+            'name': 'СУПЕРКОЛА Напиток газированный б/а 0,5л ПЭТ(НовыйЗавод):12',
+            'expect_brand': 'LOCAL',
+            'expect_category': 'ГАЗИРОВКА',
+            'level': 'NEW',
+        },
+        {
+            'name': 'МЕГАЭНЕРДЖИ Энергетический напиток тониз 0,45л ж/б(ООО Сила):24',
+            'expect_brand': 'МЕГАENERGY',
+            'expect_category': 'ЭНЕРГЕТИКИ',
+            'level': 'NEW',
+        },
     ]
 
     print(f"\n{'='*80}")
-    print("  ДЕМОНСТРАЦИЯ ПОИСКА")
+    print(f"  САМОТЕСТ — {len(tests)} тестов")
     print(f"{'='*80}\n")
 
-    for name in test_names:
-        result = brain.lookup(name)
-        status = "OK" if result.found else "??"
-        print(f"  [{status}] '{name}'")
-        if result.found:
-            print(f"       brand2={result.brand2}, proizvod2={result.proizvod2}, "
-                  f"litrag={result.litrag}")
-            print(f"       category={result.category}, subcategory={result.subcategory}")
-            print(f"       метод: {result.method}, уверенность: {result.confidence}%")
-            if result.method == 'parsed':
-                if result.category == 'ЭНЕРГЕТИКИ':
-                    print(f"       >>> НОВЫЙ ЭНЕРГЕТИК! Бренд из xname: {result.brand2}")
-                elif result.category == 'ГАЗИРОВКА':
-                    print(f"       >>> Новая газировка -> brand2=LOCAL")
+    passed = 0
+    failed = 0
+    results_by_level = {'EASY': [], 'MEDIUM': [], 'HARD': [], 'NEW': []}
+
+    for t in tests:
+        result = brain.lookup(t['name'])
+        level = t['level']
+
+        brand_ok = (result.brand2 == t['expect_brand'])
+        cat_ok = (result.category == t['expect_category'])
+
+        if level == 'NEW':
+            brand_ok = True
+            if t['expect_brand'] == 'LOCAL':
+                brand_ok = (result.brand2 == 'LOCAL')
+            cat_ok = (result.category == t['expect_category'])
+
+        ok = brand_ok and cat_ok
+        status = 'PASS' if ok else 'FAIL'
+
+        if ok:
+            passed += 1
         else:
-            print(f"       -> НЕ НАЙДЕНО")
+            failed += 1
+
+        results_by_level[level].append((t, result, ok))
+
+    for level in ['EASY', 'MEDIUM', 'HARD', 'NEW']:
+        items = results_by_level[level]
+        level_pass = sum(1 for _, _, ok in items if ok)
+        print(f"  --- {level} ({level_pass}/{len(items)}) ---")
+        for t, result, ok in items:
+            status = 'PASS' if ok else 'FAIL'
+            icon = ' OK ' if ok else 'FAIL'
+            print(f"  [{icon}] '{t['name']}'")
+            if ok:
+                print(f"         brand2={result.brand2}, category={result.category}, "
+                      f"method={result.method}, conf={result.confidence:.0f}%")
+            else:
+                print(f"         GOT:    brand2={result.brand2}, category={result.category}, "
+                      f"method={result.method}")
+                print(f"         EXPECT: brand2={t['expect_brand']}, "
+                      f"category={t['expect_category']}")
         print()
+
+    total = passed + failed
+    pct = (passed / total * 100) if total > 0 else 0
+    print(f"{'='*80}")
+    print(f"  ИТОГО: {passed}/{total} ({pct:.0f}%)")
+    if failed == 0:
+        print(f"  ВСЕ ТЕСТЫ ПРОЙДЕНЫ!")
+    else:
+        print(f"  ПРОВАЛЕНО: {failed}")
+    print(f"{'='*80}\n")
+
+    return failed == 0
 
 
 if __name__ == '__main__':
-    brain = build_brain()
-    demo_lookup(brain)
+    brain = build()
+
+    if '--build' not in sys.argv:
+        self_test(brain)
+
     brain.save_unrecognized()
