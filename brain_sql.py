@@ -108,22 +108,16 @@ def process_file(brain: ProductBrain, file_path: str):
         logger.error(f"  Столбец 'xname' не найден! Пропускаю файл.")
         return False
 
+    for col in ['brand2', 'proizvod2', 'litrag', 'category', 'subcategory']:
+        if col not in df.columns:
+            df[col] = None
+
     updated = 0
     skipped = 0
 
     for idx, row in df.iterrows():
         xname = row.get('xname', '')
         if pd.isna(xname) or str(xname).strip() == '':
-            skipped += 1
-            continue
-
-        current_brand2 = row.get('brand2', '')
-        has_brand2 = (pd.notna(current_brand2)
-                      and str(current_brand2).strip() != ''
-                      and str(current_brand2).strip().upper() != 'LOCAL'
-                      and str(current_brand2).strip().upper() != 'NAN')
-
-        if has_brand2:
             skipped += 1
             continue
 
@@ -137,12 +131,17 @@ def process_file(brain: ProductBrain, file_path: str):
             if result.litrag and result.litrag > 0:
                 df.at[idx, 'litrag'] = result.litrag
             if result.category:
-                df.at[idx, 'category'] = result.category
+                df.at[idx, 'category'] = result.category.lower()
             if result.subcategory:
                 df.at[idx, 'subcategory'] = result.subcategory
             updated += 1
+            logger.info(f"    [{result.method} {result.confidence:.0f}%] "
+                         f"{str(xname)[:50]} -> {result.brand2} / "
+                         f"{result.category} / {result.litrag}")
+        else:
+            skipped += 1
 
-    logger.info(f"  Обновлено: {updated}, пропущено: {skipped}")
+    logger.info(f"  Обновлено: {updated}, пропущено (пустых): {skipped}")
 
     df.to_excel(file_path, index=False)
     logger.info(f"  Сохранено обратно в: {file_name}")
