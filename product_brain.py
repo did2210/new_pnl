@@ -73,6 +73,7 @@ class CanonicalProduct:
     proizvod2: str
     litrag: float
     category: str
+    subcategory: str
 
 
 @dataclass
@@ -86,6 +87,7 @@ class LookupResult:
     proizvod2: str
     litrag: float
     category: str
+    subcategory: str
     matched_alias: str
 
 
@@ -101,12 +103,51 @@ _SODA_KEYWORDS = [
 ]
 
 
+_SUBCATEGORY_ENERGY_KEYWORDS = [
+    'ЭНЕРГЕТИК', 'ENERGY', 'ЭНЕРГ НАП', 'ЭНЕРГЕТ НАП',
+    'ТОНИЗИР', 'POWER', 'BOOST', 'КОФЕИН', 'CAFFEIN',
+]
+_SUBCATEGORY_SODA_KEYWORDS = [
+    'ЛИМОНАД', 'ГАЗИРОВК', 'ГАЗИРОВАНН', 'СЛАДК', 'ГАЗ НАП',
+    'КОЛА', 'COLA', 'ДЮШЕС', 'ТАРХУН', 'БАЙКАЛ', 'МОХИТО',
+    'СПРАЙТ', 'SPRITE', 'ФАНТА', 'FANTA', 'PEPSI', 'ПЕПСИ',
+]
+
+
+def guess_subcategory(xname_upper: str, category: str) -> str:
+    """Определяет subcategory для неизвестного товара по ключевым словам."""
+    if category == 'ЭНЕРГЕТИКИ':
+        if 'Ж/Б' in xname_upper or 'CAN' in xname_upper or 'ЖБ' in xname_upper:
+            return 'Энергетические напитки ж/б'
+        if 'ПЭТ' in xname_upper or 'PET' in xname_upper or 'ПЛ/БУТ' in xname_upper:
+            return 'Энергетические напитки ПЭТ'
+        return 'Энергетические напитки'
+
+    if category == 'ГАЗИРОВКА':
+        for kw in ['КОЛА', 'COLA']:
+            if kw in xname_upper:
+                return 'Лимонады кола-содержащие'
+        for kw in ['ДЮШЕС']:
+            if kw in xname_upper:
+                return 'Лимонады дюшес'
+        for kw in ['ТАРХУН']:
+            if kw in xname_upper:
+                return 'Лимонады тархун'
+        for kw in ['ЛИМОНАД', 'ГАЗИРОВАНН', 'ГАЗИР']:
+            if kw in xname_upper:
+                return 'Лимонады, сладкие газированные напитки'
+        return 'Газированные напитки'
+
+    return 'Прочее'
+
+
 def parse_xname_fields(xname: str) -> dict:
     """
     Разбирает совершенно неизвестный xname по правилам:
       - litrag: ищет паттерн вроде '0,5Л', '1.5л', '473мл'
       - category: определяет по ключевым словам
-      - brand2: берёт первое слово/группу слов до служебной части
+      - subcategory: более детальное определение типа
+      - brand2: для газировки ставит LOCAL, для энергетиков — из xname
       - proizvod2: пытается вытащить производителя из скобок
     """
     s = str(xname).strip()
@@ -132,6 +173,8 @@ def parse_xname_fields(xname: str) -> dict:
                 category = 'ГАЗИРОВКА'
                 break
 
+    subcategory = guess_subcategory(s_upper, category)
+
     proizvod2 = ''
     m_prod = re.search(r'\(([^)]+)\)', s)
     if m_prod:
@@ -150,13 +193,20 @@ def parse_xname_fields(xname: str) -> dict:
         clean = clean.replace(word, '')
     clean = re.sub(r'\s+', ' ', clean).strip()
 
-    brand2 = clean.split()[0] if clean.split() else ''
+    raw_brand = clean.split()[0] if clean.split() else ''
+
+    if category == 'ГАЗИРОВКА':
+        brand2 = 'LOCAL'
+    else:
+        brand2 = raw_brand
 
     return {
         'brand2': brand2,
+        'raw_brand': raw_brand,
         'proizvod2': proizvod2 if proizvod2 else 'UNKNOWN',
         'litrag': round(litrag, 3),
         'category': category,
+        'subcategory': subcategory,
     }
 
 
@@ -183,15 +233,22 @@ class ProductBrain:
         if missing:
             raise ValueError(f"Отсутствуют столбцы: {missing}")
 
-        df_work = df[required].copy()
+        use_cols = required + (['subcategory'] if 'subcategory' in df.columns else [])
+        df_work = df[use_cols].copy()
         df_work['brand2'] = df_work['brand2'].astype(str).str.strip().str.upper()
         df_work['proizvod2'] = df_work['proizvod2'].astype(str).str.strip().str.upper()
         df_work['category'] = df_work['category'].astype(str).str.strip().str.upper()
         df_work['litrag'] = pd.to_numeric(df_work['litrag'], errors='coerce').fillna(0.0)
+        if 'subcategory' not in df_work.columns:
+            df_work['subcategory'] = ''
+        df_work['subcategory'] = df_work['subcategory'].fillna('').astype(str).str.strip()
 
         canonical_groups = df_work.groupby(
             ['brand2', 'proizvod2', 'litrag', 'category']
-        ).agg(alias_count=('xname', 'count')).reset_index()
+        ).agg(
+            alias_count=('xname', 'count'),
+            subcategory=('subcategory', 'first')
+        ).reset_index()
 
         canonical_groups = canonical_groups.sort_values(
             'alias_count', ascending=False
@@ -208,7 +265,8 @@ class ProductBrain:
                 brand2=row['brand2'],
                 proizvod2=row['proizvod2'],
                 litrag=row['litrag'],
-                category=row['category']
+                category=row['category'],
+                subcategory=row['subcategory']
             )
             canonical_key_to_id[key] = cid
 
@@ -273,7 +331,7 @@ class ProductBrain:
     def lookup(self, xname: str) -> LookupResult:
         """Ищет xname в базе. Возвращает LookupResult."""
         if not xname or pd.isna(xname):
-            return LookupResult(False, 'not_found', 0.0, None, '', '', 0.0, '', '')
+            return LookupResult(False, 'not_found', 0.0, None, '', '', 0.0, '', '', '')
 
         xname_str = str(xname).strip()
 
@@ -282,21 +340,24 @@ class ProductBrain:
         if cid is not None:
             cp = self.canonicals[cid]
             return LookupResult(True, 'exact', 100.0, cid,
-                                cp.brand2, cp.proizvod2, cp.litrag, cp.category, xname_str)
+                                cp.brand2, cp.proizvod2, cp.litrag, cp.category,
+                                cp.subcategory, xname_str)
 
         xname_norm = normalize_text(xname_str)
         cid = self.aliases_normalized.get(xname_norm)
         if cid is not None:
             cp = self.canonicals[cid]
             return LookupResult(True, 'normalized', 95.0, cid,
-                                cp.brand2, cp.proizvod2, cp.litrag, cp.category, xname_str)
+                                cp.brand2, cp.proizvod2, cp.litrag, cp.category,
+                                cp.subcategory, xname_str)
 
         xname_key = normalize_xname_key(xname_str)
         cid = self.aliases_key.get(xname_key)
         if cid is not None:
             cp = self.canonicals[cid]
             return LookupResult(True, 'normalized', 90.0, cid,
-                                cp.brand2, cp.proizvod2, cp.litrag, cp.category, xname_str)
+                                cp.brand2, cp.proizvod2, cp.litrag, cp.category,
+                                cp.subcategory, xname_str)
 
         if HAS_FUZZY and self.all_alias_keys and xname_key:
             match = rf_process.extractOne(
@@ -310,15 +371,18 @@ class ProductBrain:
                 cid = self.aliases_key[matched_text]
                 cp = self.canonicals[cid]
                 return LookupResult(True, 'fuzzy', score, cid,
-                                    cp.brand2, cp.proizvod2, cp.litrag, cp.category, matched_text)
+                                    cp.brand2, cp.proizvod2, cp.litrag, cp.category,
+                                    cp.subcategory, matched_text)
 
         parsed = parse_xname_fields(xname_str)
         self.unrecognized.append({
             'xname': xname_str,
             'parsed_brand2': parsed['brand2'],
+            'raw_brand': parsed['raw_brand'],
             'parsed_proizvod2': parsed['proizvod2'],
             'parsed_litrag': parsed['litrag'],
             'parsed_category': parsed['category'],
+            'parsed_subcategory': parsed['subcategory'],
         })
         return LookupResult(
             found=True,
@@ -329,6 +393,7 @@ class ProductBrain:
             proizvod2=parsed['proizvod2'],
             litrag=parsed['litrag'],
             category=parsed['category'],
+            subcategory=parsed['subcategory'],
             matched_alias='',
         )
 
@@ -349,6 +414,7 @@ class ProductBrain:
                 'proizvod2': cp.proizvod2,
                 'litrag': cp.litrag,
                 'category': cp.category,
+                'subcategory': cp.subcategory,
                 'alias_count': alias_count
             })
         df_canonical = pd.DataFrame(canonical_rows)
@@ -365,7 +431,8 @@ class ProductBrain:
                     'brand2': cp.brand2,
                     'proizvod2': cp.proizvod2,
                     'litrag': cp.litrag,
-                    'category': cp.category
+                    'category': cp.category,
+                    'subcategory': cp.subcategory
                 })
         df_aliases = pd.DataFrame(alias_rows)
 
@@ -382,12 +449,20 @@ class ProductBrain:
             return
 
         df = pd.DataFrame(self.unrecognized).drop_duplicates(subset=['xname'])
-        col_order = ['xname', 'parsed_brand2', 'parsed_proizvod2', 'parsed_litrag', 'parsed_category']
+        col_order = [
+            'xname', 'parsed_brand2', 'raw_brand',
+            'parsed_proizvod2', 'parsed_litrag',
+            'parsed_category', 'parsed_subcategory'
+        ]
         for c in col_order:
             if c not in df.columns:
                 df[c] = ''
         df = df[col_order]
-        df.columns = ['xname', 'brand2 (авто)', 'proizvod2 (авто)', 'litrag (авто)', 'category (авто)']
+        df.columns = [
+            'xname', 'brand2 (авто)', 'raw_brand (из xname)',
+            'proizvod2 (авто)', 'litrag (авто)',
+            'category (авто)', 'subcategory (авто)'
+        ]
         df.to_excel(output_path, index=False)
         logger.info(f"Сохранено {len(df)} нераспознанных xname в {output_path}")
 
@@ -406,7 +481,8 @@ class ProductBrain:
                 brand2=str(row['brand2']).strip(),
                 proizvod2=str(row['proizvod2']).strip(),
                 litrag=float(row['litrag']),
-                category=str(row['category']).strip()
+                category=str(row['category']).strip(),
+                subcategory=str(row.get('subcategory', '')).strip()
             )
 
         self.aliases_exact = {}
@@ -503,9 +579,15 @@ def demo_lookup(brain: ProductBrain):
         status = "OK" if result.found else "??"
         print(f"  [{status}] '{name}'")
         if result.found:
-            print(f"       -> brand2={result.brand2}, proizvod2={result.proizvod2}, "
-                  f"litrag={result.litrag}, category={result.category}")
-            print(f"       -> метод: {result.method}, уверенность: {result.confidence}%")
+            print(f"       brand2={result.brand2}, proizvod2={result.proizvod2}, "
+                  f"litrag={result.litrag}")
+            print(f"       category={result.category}, subcategory={result.subcategory}")
+            print(f"       метод: {result.method}, уверенность: {result.confidence}%")
+            if result.method == 'parsed':
+                if result.category == 'ЭНЕРГЕТИКИ':
+                    print(f"       >>> НОВЫЙ ЭНЕРГЕТИК! Бренд из xname: {result.brand2}")
+                elif result.category == 'ГАЗИРОВКА':
+                    print(f"       >>> Новая газировка -> brand2=LOCAL")
         else:
             print(f"       -> НЕ НАЙДЕНО")
         print()
