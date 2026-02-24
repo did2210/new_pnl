@@ -1,15 +1,13 @@
 """
 brain_sql.py — Мозг с подключением к SQL Server.
 
-Что делает:
-  1. Подключается к SQL Server, читает таблицу product → строит мозг
-  2. Берёт Excel-файл из папки BRAIN_FOLDER
-  3. Расшифровывает xname → заполняет brand2, proizvod2, litrag, category, subcategory
-  4. Сохраняет результат В ТОТ ЖЕ ФАЙЛ (без создания нового)
-  5. После этого можно запустить ваш SQL-загрузчик для обновления базы
-
 Запуск:
   python brain_sql.py
+
+Появится меню:
+  1 — Ручной ввод xname (для теста)
+  2 — Обработать файлы из папки
+  0 — Выход
 """
 
 import os
@@ -75,6 +73,52 @@ def build_brain_from_sql() -> ProductBrain:
     return brain
 
 
+# =============================================================================
+#  РЕЖИМ 1: РУЧНОЙ ВВОД
+# =============================================================================
+
+def interactive_mode(brain: ProductBrain):
+    """Ручной ввод xname для проверки работы мозга."""
+    print("\n" + "=" * 60)
+    print("  РУЧНОЙ РЕЖИМ — введите xname для расшифровки")
+    print("  (пустая строка или 'выход' — назад в меню)")
+    print("=" * 60)
+
+    while True:
+        print()
+        xname = input("  xname > ").strip()
+
+        if not xname or xname.lower() in ('выход', 'exit', 'quit', 'q', '0'):
+            break
+
+        result = brain.lookup(xname)
+
+        print(f"\n  {'─' * 50}")
+        print(f"  Вход:        {xname}")
+        print(f"  {'─' * 50}")
+        print(f"  brand2:      {result.brand2}")
+        print(f"  proizvod2:   {result.proizvod2}")
+        print(f"  litrag:      {result.litrag}")
+        print(f"  category:    {result.category}")
+        print(f"  subcategory: {result.subcategory}")
+        print(f"  {'─' * 50}")
+        print(f"  метод:       {result.method}")
+        print(f"  уверенность: {result.confidence:.0f}%")
+
+        if result.method == 'parsed':
+            if result.category == 'ЭНЕРГЕТИКИ':
+                print(f"  >>> НОВЫЙ ЭНЕРГЕТИК — нет в базе")
+            elif result.category == 'ГАЗИРОВКА':
+                print(f"  >>> Новая газировка — записан как LOCAL")
+            else:
+                print(f"  >>> Не найден в базе — авторазбор")
+        print(f"  {'─' * 50}")
+
+
+# =============================================================================
+#  РЕЖИМ 2: ОБРАБОТКА ФАЙЛОВ
+# =============================================================================
+
 def find_files_in_folder(folder: str) -> list[str]:
     """Находит все Excel-файлы в папке."""
     if not os.path.exists(folder):
@@ -91,13 +135,7 @@ def find_files_in_folder(folder: str) -> list[str]:
 
 
 def process_file(brain: ProductBrain, file_path: str):
-    """
-    Обрабатывает один файл:
-    - Читает Excel
-    - Расшифровывает xname через мозг
-    - Заполняет brand2, proizvod2, litrag, category, subcategory
-    - Сохраняет ОБРАТНО в тот же файл
-    """
+    """Обрабатывает один файл: расшифровывает xname, сохраняет в тот же файл."""
     file_name = os.path.basename(file_path)
     logger.info(f"Обработка файла: {file_name}")
 
@@ -148,38 +186,68 @@ def process_file(brain: ProductBrain, file_path: str):
     return True
 
 
-def main():
-    print("=" * 60)
-    print("  МОЗГ + SQL SERVER")
-    print("=" * 60)
-
-    # 1) Строим мозг из SQL
-    brain = build_brain_from_sql()
-
-    # 2) Ищем файлы в папке brain
+def file_mode(brain: ProductBrain):
+    """Обработка файлов из папки."""
     files = find_files_in_folder(BRAIN_FOLDER)
 
     if not files:
-        logger.info(f"\nНет файлов для обработки в папке: {BRAIN_FOLDER}")
-        logger.info("Положите Excel-файлы с колонкой 'xname' в эту папку и запустите снова.")
+        print(f"\n  Нет файлов в папке: {BRAIN_FOLDER}")
+        print(f"  Положите Excel с колонкой 'xname' и запустите снова.")
         return
 
-    logger.info(f"\nНайдено {len(files)} файлов для обработки:")
+    print(f"\n  Найдено {len(files)} файлов:")
     for f in files:
-        logger.info(f"  {os.path.basename(f)}")
+        print(f"    {os.path.basename(f)}")
 
-    # 3) Обрабатываем каждый файл
+    confirm = input(f"\n  Обработать? (да/нет) > ").strip().lower()
+    if confirm not in ('да', 'yes', 'y', 'д'):
+        print("  Отменено.")
+        return
+
     success = 0
     for file_path in files:
         try:
             if process_file(brain, file_path):
                 success += 1
         except Exception as e:
-            logger.error(f"Ошибка при обработке {os.path.basename(file_path)}: {e}")
+            logger.error(f"Ошибка: {os.path.basename(file_path)}: {e}")
 
-    print(f"\nГотово! Обработано файлов: {success}/{len(files)}")
-    print(f"Файлы обновлены в папке: {BRAIN_FOLDER}")
-    print(f"Теперь можно запускать SQL-загрузчик для обновления базы.")
+    print(f"\n  Готово! Обработано: {success}/{len(files)}")
+    print(f"  Файлы обновлены в: {BRAIN_FOLDER}")
+
+
+# =============================================================================
+#  ГЛАВНОЕ МЕНЮ
+# =============================================================================
+
+def main():
+    print("=" * 60)
+    print("  МОЗГ + SQL SERVER")
+    print("=" * 60)
+
+    brain = build_brain_from_sql()
+
+    while True:
+        print("\n" + "=" * 60)
+        print("  МЕНЮ")
+        print("=" * 60)
+        print("  1 — Ручной ввод xname (тест)")
+        print(f"  2 — Обработать файлы из папки")
+        print(f"      ({BRAIN_FOLDER})")
+        print("  0 — Выход")
+        print("=" * 60)
+
+        choice = input("\n  Выбор > ").strip()
+
+        if choice == '1':
+            interactive_mode(brain)
+        elif choice == '2':
+            file_mode(brain)
+        elif choice in ('0', 'выход', 'exit', 'quit', 'q'):
+            print("\n  До свидания!")
+            break
+        else:
+            print("  Неверный выбор. Введите 1, 2 или 0.")
 
 
 if __name__ == '__main__':
