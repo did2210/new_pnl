@@ -79,7 +79,7 @@ class CanonicalProduct:
 class LookupResult:
     """Результат поиска в мозге."""
     found: bool
-    method: str  # 'exact', 'normalized', 'fuzzy', 'not_found'
+    method: str  # 'exact', 'normalized', 'fuzzy', 'parsed', 'not_found'
     confidence: float
     canonical_id: Optional[int]
     brand2: str
@@ -87,6 +87,77 @@ class LookupResult:
     litrag: float
     category: str
     matched_alias: str
+
+
+# Ключевые слова для автоопределения категории из xname
+_ENERGY_KEYWORDS = [
+    'ЭНЕРГ', 'ENERGY', 'ЭНЕРГЕТИК', 'ЭНЕРГЕТ', 'ТОНИЗИР', 'ТОНИЗ',
+    'POWER', 'BOOST', 'CAFFEIN', 'КОФЕИН', 'ТАУРИНПЛ', 'ТАУРИНСОД',
+]
+_SODA_KEYWORDS = [
+    'ГАЗ', 'ГАЗИР', 'ЛИМОНАД', 'ДЮШЕС', 'ТАРХУН', 'БАЙКАЛ', 'КОЛА',
+    'COLA', 'МОХИТО', 'MOJITO', 'SPRITE', 'FANTA', 'PEPSI',
+    'СИЛЬНОГАЗ', 'СИЛ/ГАЗ', 'СИЛГАЗ',
+]
+
+
+def parse_xname_fields(xname: str) -> dict:
+    """
+    Разбирает совершенно неизвестный xname по правилам:
+      - litrag: ищет паттерн вроде '0,5Л', '1.5л', '473мл'
+      - category: определяет по ключевым словам
+      - brand2: берёт первое слово/группу слов до служебной части
+      - proizvod2: пытается вытащить производителя из скобок
+    """
+    s = str(xname).strip()
+    s_upper = s.upper()
+
+    litrag = 0.0
+    m = re.search(r'(\d+[.,]?\d*)\s*Л', s_upper)
+    if m:
+        litrag = float(m.group(1).replace(',', '.'))
+    else:
+        m = re.search(r'(\d+)\s*МЛ', s_upper)
+        if m:
+            litrag = float(m.group(1)) / 1000.0
+
+    category = 'ПРОЧЕЕ'
+    for kw in _ENERGY_KEYWORDS:
+        if kw in s_upper:
+            category = 'ЭНЕРГЕТИКИ'
+            break
+    if category == 'ПРОЧЕЕ':
+        for kw in _SODA_KEYWORDS:
+            if kw in s_upper:
+                category = 'ГАЗИРОВКА'
+                break
+
+    proizvod2 = ''
+    m_prod = re.search(r'\(([^)]+)\)', s)
+    if m_prod:
+        proizvod2 = m_prod.group(1).strip().upper()
+
+    clean = re.sub(r'\(.*?\)', '', s_upper)
+    clean = re.sub(r':\d+\s*$', '', clean)
+    clean = re.sub(r'\d+[.,]?\d*\s*(Л|МЛ|ПЭТ|PET|CAN|Ж/Б|СТ/Б|ПЛ/БУТ)', '', clean)
+    noise = [
+        'НАПИТОК', 'НАПИТ', 'НАП', 'ЭНЕРГЕТИЧЕСКИЙ', 'ЭНЕРГЕТИК', 'ЭНЕРГЕТ', 'ЭНЕРГ',
+        'Б/А', 'БЕЗАЛК', 'БЕЗАЛКОГОЛЬНЫЙ', 'СИЛЬНОГАЗ', 'СИЛГАЗ', 'СИЛ/ГАЗ',
+        'НЕГАЗ', 'ГАЗИРОВАННЫЙ', 'ГАЗИР', 'ГАЗ', 'ТОНИЗИРУЮЩИЙ', 'ТОНИЗ',
+        'КОКТЕЙЛЬ', 'СОКОСОДЕРЖАЩИЙ', 'С МЯК', 'ОСВ', 'ОСВЕТЛ',
+    ]
+    for word in noise:
+        clean = clean.replace(word, '')
+    clean = re.sub(r'\s+', ' ', clean).strip()
+
+    brand2 = clean.split()[0] if clean.split() else ''
+
+    return {
+        'brand2': brand2,
+        'proizvod2': proizvod2 if proizvod2 else 'UNKNOWN',
+        'litrag': round(litrag, 3),
+        'category': category,
+    }
 
 
 class ProductBrain:
@@ -241,8 +312,25 @@ class ProductBrain:
                 return LookupResult(True, 'fuzzy', score, cid,
                                     cp.brand2, cp.proizvod2, cp.litrag, cp.category, matched_text)
 
-        self.unrecognized.append({'xname': xname_str})
-        return LookupResult(False, 'not_found', 0.0, None, '', '', 0.0, '', '')
+        parsed = parse_xname_fields(xname_str)
+        self.unrecognized.append({
+            'xname': xname_str,
+            'parsed_brand2': parsed['brand2'],
+            'parsed_proizvod2': parsed['proizvod2'],
+            'parsed_litrag': parsed['litrag'],
+            'parsed_category': parsed['category'],
+        })
+        return LookupResult(
+            found=True,
+            method='parsed',
+            confidence=30.0,
+            canonical_id=None,
+            brand2=parsed['brand2'],
+            proizvod2=parsed['proizvod2'],
+            litrag=parsed['litrag'],
+            category=parsed['category'],
+            matched_alias='',
+        )
 
     def lookup_batch(self, xnames: list[str]) -> list[LookupResult]:
         """Пакетный поиск для списка xname."""
@@ -288,16 +376,18 @@ class ProductBrain:
         logger.info(f"Сохранено: {len(df_canonical)} эталонов, {len(df_aliases)} алиасов")
 
     def save_unrecognized(self, output_path: str = UNRECOGNIZED_FILE):
-        """Сохраняет нераспознанные xname для ручной разметки."""
+        """Сохраняет нераспознанные xname с автоматическим разбором для ручной проверки."""
         if not self.unrecognized:
             logger.info("Нераспознанных записей нет")
             return
 
-        df = pd.DataFrame(self.unrecognized).drop_duplicates()
-        df['brand2'] = ''
-        df['proizvod2'] = ''
-        df['litrag'] = ''
-        df['category'] = ''
+        df = pd.DataFrame(self.unrecognized).drop_duplicates(subset=['xname'])
+        col_order = ['xname', 'parsed_brand2', 'parsed_proizvod2', 'parsed_litrag', 'parsed_category']
+        for c in col_order:
+            if c not in df.columns:
+                df[c] = ''
+        df = df[col_order]
+        df.columns = ['xname', 'brand2 (авто)', 'proizvod2 (авто)', 'litrag (авто)', 'category (авто)']
         df.to_excel(output_path, index=False)
         logger.info(f"Сохранено {len(df)} нераспознанных xname в {output_path}")
 
@@ -389,6 +479,7 @@ def build_brain():
 def demo_lookup(brain: ProductBrain):
     """Демонстрация поиска с разными вариантами написания."""
     test_names = [
+        # Известные бренды — разные варианты написания
         "TORNADO ENERGY Напиток энергет айс 0,5л(Росинка):12",
         "tornado energy",
         "FRESH BAR Мохито Напит б/а Сильногаз0,48л пл/бут(Росинка):12",
@@ -397,6 +488,9 @@ def demo_lookup(brain: ProductBrain):
         "eon citrus",
         "COCA-COLA Напиток газированный 1,5л пл/бут(Кока-Кола):9",
         "кока кола 1.5",
+        # Совершенно новый бренд — его нет в базе
+        "СУПЕРКОЛА Напиток газированный б/а 0,5л ПЭТ(НовыйЗавод):12",
+        "МЕГАЭНЕРДЖИ Энергетический напиток тониз 0,45л ж/б(ООО Сила):24",
         "НЕСУЩЕСТВУЮЩИЙ ТОВАР 777",
     ]
 
