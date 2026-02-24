@@ -263,10 +263,11 @@ def parse_plan_calendar(df_sales: pd.DataFrame) -> Optional[PlanCalendar]:
     current_month_name = None
     
     for col_idx in range(len(row_months)):
-        week_cell_raw = str(row_weeks.iloc[col_idx]).strip()
-        if any(marker in week_cell_raw.lower() for marker in exclude_markers):
-            continue
-        
+        # СНАЧАЛА обновляем текущий месяц — даже для столбцов «Итого/Всего».
+        # Причина: Excel объединяет ячейки, и «декабрь» может оказаться
+        # именно на столбце «Всего» предыдущего месяца (ноябрь).
+        # Если пропустить этот столбец целиком (continue), то cur_month
+        # не обновится и все последующие недели уйдут в ноябрь.
         month_cell = str(row_months.iloc[col_idx]).strip().lower()
         for idx, month_name in enumerate(MONTH_NAMES_RU):
             if month_name in month_cell:
@@ -281,6 +282,11 @@ def parse_plan_calendar(df_sales: pd.DataFrame) -> Optional[PlanCalendar]:
                         week_numbers=[]
                     )
                 break
+        
+        # ПОТОМ проверяем, нужно ли пропустить этот столбец
+        week_cell_raw = str(row_weeks.iloc[col_idx]).strip()
+        if any(marker in week_cell_raw.lower() for marker in exclude_markers):
+            continue
         
         week_cell = week_cell_raw.upper()
         m = re.match(r'^W(\d{1,2})$', week_cell)
@@ -463,7 +469,8 @@ def distribute_weekly_to_contract_months(
         logger.error("Не найдена стартовая неделя в календаре!")
         return result
     
-    for i in range(52):
+    # 104 = до 2 лет (контракт может быть дольше 52 недель, например дек→дек = 57 нед.)
+    for i in range(104):
         global_week = start_global_week + i
         
         if global_week not in ECP_CALENDAR:
@@ -514,7 +521,7 @@ def calculate_monthly_tm_plan(
     
     month_tm_values: dict[tuple[int, int], list[float]] = {key: [] for key in result.keys()}
     
-    for i in range(52):
+    for i in range(104):
         global_week = start_global_week + i
         if global_week not in ECP_CALENDAR:
             break
@@ -559,7 +566,7 @@ def calculate_monthly_price(
     
     month_prices: dict[tuple[int, int], list[float]] = {key: [] for key in result.keys()}
     
-    for i in range(52):
+    for i in range(104):
         global_week = start_global_week + i
         if global_week not in ECP_CALENDAR:
             break
@@ -604,7 +611,7 @@ def calculate_prom_vol_monthly(
     if start_global_week is None:
         return result
     
-    for i in range(52):
+    for i in range(104):
         global_week = start_global_week + i
         if global_week not in ECP_CALENDAR:
             break
